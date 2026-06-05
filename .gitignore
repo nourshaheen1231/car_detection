@@ -1,0 +1,9 @@
+*.mp4
+*.avi
+*.pt
+*.pkl
+*.zip
+*.mov
+output_videos/
+input_videos/
+tracker_stubs/
