@@ -1,19 +1,15 @@
-# تجاهل كل ملفات الفيديو
 *.mp4
 *.avi
 *.mov
 
-# تجاهل ملفات النماذج الكبيرة
 *.pt
 *.pkl
 *.zip
 
-# تجاهل محتوى المجلدات بالكامل
 input_videos/*
 output_videos/*
 tracker_stubs/*
 
-# لكن لا تتجاهل المجلد نفسه
 !input_videos/
 !output_videos/
 !tracker_stubs/
