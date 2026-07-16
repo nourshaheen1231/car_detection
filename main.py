@@ -1,23 +1,34 @@
 from utils import read_video, save_video
-from detections import CarDetection
+from detections import CarDetection, CarColorDetection
+
 
 def main():
     input_video_path = 'input_videos/input_video2.mp4'
-    
+
     # Read video frames
     video_frames = read_video(input_video_path)
 
     # Initialize car detection
     car_detecttor = CarDetection(model_path='yolo11n.pt')
 
-    # Detect cars in video frames
-    car_detections = car_detecttor.detect_frames(video_frames,read_from_stub=False,stub_path="tracker_stubs/car_detection.pkl")
+    # Initialize color detection using the pretrained CNN model.
+    color_detector = CarColorDetection(
+        model_path='Car_Color_Detection.keras',
+        history_size=15,
+        rescale=1.0 / 255.0,
+        min_confidence=0.40,
+    )
 
-    # Draw bounding boxes on video frames
-    output_frames = car_detecttor.draw_bboxes(video_frames, car_detections)
+    output_frames = car_detecttor.process_video(
+        video_frames,
+        color_detector=color_detector,
+        read_from_stub=False,
+        stub_path="tracker_stubs/car_detection.pkl",
+    )
 
     # Save processed video
-    save_video(output_frames, output_path="output_videos/output_video.mp4")
+    save_video(output_frames, output_path="output_videos/output_video2.mp4")
+
 
 if __name__ == "__main__":
     main()
