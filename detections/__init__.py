@@ -1,2 +1,3 @@
 from .car_detectiom import CarDetection
 from .car_color_detection import CarColorDetection
+from .car_mmr_detection import CarMakeModelDetection
