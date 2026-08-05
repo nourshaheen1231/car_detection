@@ -1,10 +1,11 @@
-*.mp4
 *.avi
 *.mov
 
 *.pt
 *.pkl
 *.zip
+*.keras
+*.json
 
 input_videos/*
 output_videos/*
@@ -13,3 +14,8 @@ tracker_stubs/*
 !input_videos/
 !output_videos/
 !tracker_stubs/
+
+
+!output_videos/.gitkeep
+!input_videos/.gitkeep
+!tracker_stubs/.gitkeep

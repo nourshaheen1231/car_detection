@@ -1,1 +1,3 @@
-from .car_detectiom import CarDetection
+from .car_detection import CarDetection
+from .car_type_classifier import CarTypeClassifier
+from .car_color_detection import CarColorDetection
