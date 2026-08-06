@@ -1,4 +1,5 @@
 from utils import read_video, save_video
+from utils.profiler import PerformanceProfiler
 from detections import CarDetection, CarColorDetection
 
 
@@ -8,8 +9,9 @@ def main():
     # Read video frames
     video_frames = read_video(input_video_path)
 
-    # Initialize car detection
-    car_detecttor = CarDetection(model_path='yolo11n.pt')
+    profiler = PerformanceProfiler()
+
+    car_detecttor = CarDetection(model_path='yolo11n.pt', profiler=profiler)
 
     # Initialize color detection using the pretrained CNN model.
     color_detector = CarColorDetection(
@@ -17,6 +19,7 @@ def main():
         history_size=15,
         rescale=1.0 / 255.0,
         min_confidence=0.40,
+        profiler=profiler,
     )
 
     output_frames = car_detecttor.process_video(
@@ -27,7 +30,9 @@ def main():
     )
 
     # Save processed video
-    save_video(output_frames, output_path="output_videos/output_video2.mp4")
+    save_video(output_frames, output_path="output_videos/output_video22222.mp4")
+
+    profiler.print_summary()
 
 
 if __name__ == "__main__":

@@ -2,13 +2,14 @@ import cv2 as cv
 import pickle
 from ultralytics import YOLO
 
+
 class CarDetection():
-    def __init__(self, model_path):
+    def __init__(self, model_path, profiler=None):
         self.model = YOLO(model_path)
+        self.profiler = profiler
 
     def process_video(self, video_frames, color_detector=None,
                        read_from_stub=False, stub_path=None):
-      
         output_frames = []
 
         if read_from_stub and stub_path is not None:
@@ -16,17 +17,27 @@ class CarDetection():
                 car_detections = pickle.load(f)
 
             for frame, car_dict in zip(video_frames, car_detections):
-                output_frames.append(self._draw_frame(frame, car_dict, color_detector))
+                if self.profiler is not None:
+                    with self.profiler.timer("frame_total"):
+                        output_frames.append(self._draw_frame(frame, car_dict, color_detector))
+                else:
+                    output_frames.append(self._draw_frame(frame, car_dict, color_detector))
             return output_frames
 
         all_car_dicts = [] if stub_path is not None else None
 
         for frame in video_frames:
-            car_dict = self.detect_frame(frame)          
-            if all_car_dicts is not None:
-                all_car_dicts.append(car_dict)
-
-            output_frames.append(self._draw_frame(frame, car_dict, color_detector))
+            if self.profiler is not None:
+                with self.profiler.timer("frame_total"):
+                    car_dict = self.detect_frame(frame)         
+                    if all_car_dicts is not None:
+                        all_car_dicts.append(car_dict)
+                    output_frames.append(self._draw_frame(frame, car_dict, color_detector))
+            else:
+                car_dict = self.detect_frame(frame)
+                if all_car_dicts is not None:
+                    all_car_dicts.append(car_dict)
+                output_frames.append(self._draw_frame(frame, car_dict, color_detector))
 
         if stub_path is not None:
             with open(stub_path, 'wb') as f:
@@ -35,15 +46,17 @@ class CarDetection():
         return output_frames
 
     def _draw_frame(self, frame, car_dict, color_detector):
+        if color_detector is not None and car_dict:
+            colors_by_track_id = color_detector.get_stable_colors_for_frame(frame, car_dict)
+        else:
+            colors_by_track_id = {}
+
         for track_id, bbox in car_dict.items():
             x1, y1, x2, y2 = bbox
 
             if color_detector is not None:
-                color_name = color_detector.get_stable_color(track_id, frame, bbox)
-                # label = f"Car #{track_id} - {color_name}"
-
-                conf = color_detector._color_cache.get(track_id, {}).get("confidence", 0)
-                label = f"Car #{track_id} - {color_name} ({conf:.2f})"  
+                color_name = colors_by_track_id.get(track_id, "Unknown")
+                label = f"Car #{track_id} - {color_name}"
             else:
                 label = "Car"
 
@@ -72,7 +85,12 @@ class CarDetection():
         return car_detections
 
     def detect_frame(self, frame):
-        results = self.model.track(frame, iou=0.1, conf=0.3, persist=True)[0]
+        if self.profiler is not None:
+            with self.profiler.timer("yolo_track"):
+                results = self.model.track(frame, iou=0.1, conf=0.3, persist=True)[0]
+        else:
+            results = self.model.track(frame, iou=0.1, conf=0.3, persist=True)[0]
+
         id_name_dict = results.names
 
         car_dict = {}
@@ -92,7 +110,6 @@ class CarDetection():
         return car_dict
 
     def draw_bboxes(self, video_frames, car_detections, color_detector=None):
-      
         output_frames = []
         for frame, car_dict in zip(video_frames, car_detections):
             output_frames.append(self._draw_frame(frame, car_dict, color_detector))
