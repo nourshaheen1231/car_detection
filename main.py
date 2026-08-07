@@ -5,6 +5,7 @@ from detections import (
     CarTypeClassifier,
     CarColorDetection,
     CarMakeModelDetection,
+    PlateDetector,
 )
 
 
@@ -23,7 +24,7 @@ def load_mmr_labels(label_path):
 
 def main():
     start_time = time.time()
-    input_video_path = "input_videos/input_video3.mp4"
+    input_video_path = "input_videos/input_video1.mp4"
 
     video_frames, fps = read_video(input_video_path)
 
@@ -62,6 +63,7 @@ def main():
         type_classifier=type_classifier,
         color_detector=color_detector,
         make_model_detector=mmr_detector,
+        plate_detector=PlateDetector(), 
         confidence_threshold=0.55,
     )
 
@@ -74,7 +76,7 @@ def main():
 
     # رسم النتائج وحفظ الفيديو والسجلات
     output_frames = car_detector.draw_bboxes(video_frames, car_detections)
-    save_video(output_frames, output_path="output_videos/output_video32.mp4", fps=fps)
+    save_video(output_frames, output_path="output_videos/output_video1.2.mp4", fps=fps)
 
     car_detector.save_tracking_log("tracking_log27.json")
 

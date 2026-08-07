@@ -15,13 +15,17 @@ class CarDetection:
         type_classifier=None,
         color_detector=None,
         make_model_detector=None,
+        plate_detector=None, 
         confidence_threshold=0.6,
+        plate_roi_ratio=0.45, 
     ):
         self.model = YOLO(model_path)
         self.type_classifier = type_classifier
         self.color_detector = color_detector
         self.make_model_detector = make_model_detector
+        self.plate_detector = plate_detector
         self.confidence_threshold = confidence_threshold
+        self.plate_roi_ratio = plate_roi_ratio
 
         self.tracking_log = {}
 
@@ -36,6 +40,25 @@ class CarDetection:
             return None
 
         return frame[y1:y2, x1:x2]
+
+    def _clip_bbox(self, frame, bbox):
+            """يرجع إحداثيات الـ bbox بعد قصّها لتطابق حدود الفريم (نفس منطق _crop لكن بيرجع الإحداثيات)."""
+            x1, y1, x2, y2 = [int(v) for v in bbox]
+            h, w, _ = frame.shape
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            return x1, y1, x2, y2
+
+    def _crop_plate_roi(self, car_crop):
+    
+            if car_crop is None or car_crop.size == 0:
+                return None, 0
+    
+            h, w = car_crop.shape[:2]
+            y_offset = int(h * self.plate_roi_ratio)
+            return car_crop[y_offset:h, 0:w], y_offset
+
+    
 
     def detect_frames(self, frames, read_from_stub=False, stub_path=None):
         if read_from_stub and stub_path is not None:
@@ -107,6 +130,29 @@ class CarDetection:
                     track_id, crop, frame_idx
                 )
 
+            # =====================================================
+            # Plate Detection (if applicable)
+            # =====================================================
+            plate_bbox = None
+            if (
+                cls_name in self.CLASSIFIABLE_YOLO_CLASSES
+                and self.plate_detector is not None
+                and crop is not None
+            ):
+                plate_roi, y_offset = self._crop_plate_roi(crop)
+                # plate_local_box = self.plate_detector.detect_plate_location_dynamic(plate_roi)
+                plate_local_box = self.plate_detector.detect_plate_location_dynamic_guassanian(plate_roi)
+
+                if plate_local_box is not None:
+                    px, py, pw, ph = plate_local_box
+                    x1_car, y1_car, _, _ = self._clip_bbox(frame, bbox)
+                    plate_bbox = [
+                        x1_car + px,
+                        y1_car + y_offset + py,
+                        x1_car + px + pw,
+                        y1_car + y_offset + py + ph,
+                    ]
+
             # تسجيل البيانات في السجل Log
             if track_id != -1:
                 self._log_prediction(
@@ -120,6 +166,7 @@ class CarDetection:
                     color_vote,
                     make_model_name,
                     make_model_conf,
+                    plate_bbox,
                 )
 
             car_list.append(
@@ -134,6 +181,7 @@ class CarDetection:
                     "color_conf": color_vote,
                     "make_model_name": make_model_name,
                     "make_model_conf": make_model_conf,
+                    "plate_bbox": plate_bbox,
                 }
             )
 
@@ -161,6 +209,7 @@ class CarDetection:
         color_vote,
         make_model_name,
         make_model_conf,
+        plate_bbox=None, 
     ):
         if track_id not in self.tracking_log:
             self.tracking_log[track_id] = []
@@ -184,6 +233,7 @@ class CarDetection:
                 "make_model_confidence": round(make_model_conf, 3)
                 if make_model_conf is not None
                 else 0.0,
+                "plate_bbox": plate_bbox,
             }
         )
 
@@ -283,6 +333,14 @@ class CarDetection:
                     (0, 255, 255),  # أصفر سماوي
                     2,
                 )
+                
+                # =====================================================
+                # Plate Detection Drawing
+                # =====================================================
+                if detection.get("plate_bbox") is not None:
+                    px1, py1, px2, py2 = [int(v) for v in detection["plate_bbox"]]
+                    cv.rectangle(frame, (px1, py1), (px2, py2), (0, 0, 255), 2)
+                    _draw_label(frame, "Plate", px1, py1 - 4, (0, 0, 255))
 
             output_frames.append(frame)
 
