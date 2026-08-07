@@ -1,11 +1,9 @@
 {
   "0": "Convertible",
   "1": "Coupe",
-  "2": "Crossover",
-  "3": "Hatchback",
-  "4": "Pick-Up",
-  "5": "SUV",
-  "6": "Sedan",
-  "7": "Sports",
-  "8": "VAN"
+  "2": "Hatchback",
+  "3": "Pick-Up",
+  "4": "SUV",
+  "5": "Sedan",
+  "6": "VAN"
 }

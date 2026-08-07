@@ -18,7 +18,7 @@ class CarColorDetection:
                  history_size: int = 15,
                  input_size: tuple = (128, 128),
                  rescale: float = 1.0 / 255.0,
-                 min_confidence: float = 0.4,
+                 min_confidence: float = 0.55,
                  compute_interval: int = 5):   
 
         self.model = load_model(model_path)
@@ -31,14 +31,21 @@ class CarColorDetection:
         self._color_history = {}
         self._color_cache = {}    
         self._frame_counters = {}
+
+        self.last_seen_frame = {}  # لتخزين رقم آخر فريم ظهرت فيه كل سيارة
+        self.max_lost_frames = 120  # فترة السماح (مثلاً 120 فريم = 4 ثواني تقريباً)
     # ===============================
     # MAIN FUNCTION
     # ===============================
-    def get_stable_color(self, track_id, frame, bbox):
-
+    def get_stable_color(self, track_id, crop, frame_idx):
+        if track_id == -1:
+            return self._predict_color(crop)
         # زيادة العداد الخاص بهذه السيارة تحديداً
         self._frame_counters[track_id] = self._frame_counters.get(track_id, 0) + 1
         current_count = self._frame_counters[track_id]
+
+        # [جديد] تسجيل آخر فريم ظهرت فيه هذه السيارة
+        self.last_seen_frame[track_id] = frame_idx
 
         # 1. التحقق من الـ Cache (لتخفيف الضغط وعدم الحساب في كل إطار)
         if track_id in self._color_cache:
@@ -46,9 +53,9 @@ class CarColorDetection:
                 return self._color_cache[track_id]["color"], self._color_cache[track_id].get("confidence", 0.0)
 
         # 2. التنبؤ باللون الجديد (استخدمنا اسم raw_color لتجنب التضارب)
-        raw_color, raw_confidence = self._predict_color(frame, bbox)
+        raw_color, raw_confidence = self._predict_color(crop)
 
-        print(f"[Car {track_id}] Color: {raw_color} | Confidence: {raw_confidence:.2f}")
+        # print(f"[Car {track_id}] Color: {raw_color} | Confidence: {raw_confidence:.2f}")
 
         # ===============================
         # Temporal smoothing (التصويت الزمني)
@@ -77,23 +84,37 @@ class CarColorDetection:
         total_weight = sum(weighted_scores.values())
         vote_ratio = weighted_scores[final_color] / total_weight
 
-        # 3. تحديث الـ Cache بالنتيجة النهائية (المستقرة)
+        # 5. تطبيق المنطق الذكي الموحد
+        if vote_ratio >= 0.5 and final_color != "Unknown":
+            # الحالة الأولى: التصويت الزمني حاسم والأغلبية متفقة
+            final_color = final_color
+            final_conf = vote_ratio
+
+        elif raw_color != "Unknown" and raw_confidence >= self.min_confidence:
+            # الحالة الثانية: التصويت لم يحسم بعد، لكن الفريم الحالي واضح جداً (ثقة أعلى من 70%)
+            final_color = raw_color
+            final_conf = raw_confidence
+
+        else:
+            # الحالة الثالثة: التصويت تائه والفريم الحالي ضعيف، نستسلم
+            final_color = "Unknown"
+            final_conf = 0.0
+
+        # 6. تحديث الـ Cache بالنتيجة النهائية
         self._color_cache[track_id] = {
             "color": final_color,
-            "confidence": vote_ratio
+            "confidence": final_conf
         }
 
-        return final_color, vote_ratio
+        return final_color, final_conf
 
     # ===============================
     # COLOR PREDICTION
     # ===============================
-    def _predict_color(self, frame, bbox):
+    def _predict_color(self, crop):
 
-        crop = self._crop(frame, bbox)
-        if crop is None:
+        if crop is None or crop.size == 0:
             return "Unknown", 0.0
-
         # ===============================
         # CNN
         # ===============================
@@ -170,44 +191,45 @@ class CarColorDetection:
     # ===============================
     # CROP
     # ===============================
-    def _crop(self, frame, bbox):
+    # def _crop(self, frame, bbox):
 
-        x1, y1, x2, y2 = map(int, bbox)
-        x1, y1 = max(x1, 0), max(y1, 0)
+    #     x1, y1, x2, y2 = map(int, bbox)
+    #     x1, y1 = max(x1, 0), max(y1, 0)
 
-        crop = frame[y1:y2, x1:x2]
+    #     crop = frame[y1:y2, x1:x2]
 
-        if crop.size == 0:
-            return None
+    #     if crop.size == 0:
+    #         return None
 
-        return crop
+    #     return crop
 
 
 
-    def cleanup_inactive_tracks(self, active_track_ids):
+    def cleanup_inactive_tracks(self, current_frame_idx):
         """
-        تستقبل قائمة الـ track_ids التابعة للسيارات الموجودة حالياً في الفريم،
-        وتحذف بيانات أي سيارة اختفت لمنع استهلاك الذاكرة.
+        يحذف بيانات السيارات التي غابت عن الشاشة لفترة تتجاوز max_lost_frames
         """
-        active_set = set(active_track_ids)
+        lost_ids = []
+        
+        # تحديد السيارات المفقودة بناءً على آخر فريم شوهدت فيه
+        for tid, last_frame in list(self.last_seen_frame.items()):
+            if (current_frame_idx - last_frame) > self.max_lost_frames:
+                lost_ids.append(tid)
 
-        # 1. تنظيف كاش اللون
-        for tid in list(self._color_cache.keys()):
-            if tid not in active_set:
+        # تنظيف شامل للسيارات المفقودة فقط
+        for tid in lost_ids:
+            if tid in self._color_cache:
                 del self._color_cache[tid]
-
-        # 2. تنظيف عداد الفريمات
-        for tid in list(self._frame_counters.keys()):
-            if tid not in active_set:
+            if tid in self._frame_counters:
                 del self._frame_counters[tid]
-
-        # 3. تنظيف سجل التاريخ الزمني (History)
-        for tid in list(self._color_history.keys()):
-            if tid not in active_set:
+            if tid in self._color_history:
                 del self._color_history[tid]
+            del self.last_seen_frame[tid]
+
 
     def reset(self):
-        """تفريغ كلي لجميع القواميس مع تصحيح اسم عداد الفريمات"""
+        """تفريغ كلي لجميع القواميس"""
         self._color_history.clear()
         self._color_cache.clear()
-        self._frame_counters.clear()  # تم تصحيح المفرد إلى الجمع _frame_counters
+        self._frame_counters.clear()
+        self.last_seen_frame.clear()  # <--- [جديد]

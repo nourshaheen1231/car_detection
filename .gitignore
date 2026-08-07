@@ -1,12 +1,12 @@
 *.avi
 *.mov
 
-*.pt
+# *.pt
 *.pkl
 *.zip
-*.keras
+# *.keras
 *.json
-
+fix_pt.py
 input_videos/*
 output_videos/*
 tracker_stubs/*
