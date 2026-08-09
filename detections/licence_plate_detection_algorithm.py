@@ -6,101 +6,233 @@ from ultralytics import YOLO
 
 class PlateDetector:
 
-    # def detect_plate_location_dynamic(self, car_roi):
-    #     if car_roi is None or car_roi.size == 0:
-    #         return None
-            
-    #     h_car, w_car = car_roi.shape[:2]
-    #     car_area = w_car * h_car
-        
-    #     # kernel_w = max(3, int(w_car * 0.06))
+    def __init__(self, max_lost_frames=5, plate_roi_ratio=0.45, min_plate_confidence=0.3):
+        """
+        تهيئة كاشف اللوحة مع دعم التتبع الذكي (Projection + Re-detection).
 
-    #     # أخر نتيجى توصلنالها
-    #     kernel_w = max(3, int(w_car * 0.035))
-    #     kernel_h = max(2, int(h_car * 0.02))
+        Args:
+            max_lost_frames: عدد الفريمات الأقصى قبل اعتبار اللوحة مفقودة
+            plate_roi_ratio: نسبة القص لأخذ الجزء السفلي من السيارة
+            min_plate_confidence: أدنى ثقة مقبولة لمسار اللوحة
+        """
+        self.max_lost_frames = max_lost_frames
+        self.plate_roi_ratio = plate_roi_ratio
+        self.min_plate_confidence = min_plate_confidence
 
-    #     # kernel_w = min(40, max(5, int(w_car * 0.045))) 
-    #     # kernel_h = max(2, int(h_car * 0.02))
-        
-    #     min_plate_area = car_area * 0.005
-    #     max_plate_area = car_area * 0.15
+        # تتبع اللوحات: {plate_track_id: {rel_bbox, confidence, last_seen, status, ...}}
+        self.plate_tracks = {}
+        # ربط السيارة باللوحة: {car_track_id: plate_track_id}
+        self.car_to_plate = {}
+        self.next_plate_id = 101
 
-    #     gray = cv.cvtColor(car_roi, cv.COLOR_BGR2GRAY)
+    # =========================================================
+    # دوال التتبع الأساسية (من شغل الزميل الأول)
+    # =========================================================
+    def relative_bbox(self, vehicle_bbox, plate_bbox):
+        """Where the plate sits inside its vehicle box, as 0..1 ratios."""
+        xcar1, ycar1, xcar2, ycar2 = vehicle_bbox
+        car_width = max(xcar2 - xcar1, 1)
+        car_height = max(ycar2 - ycar1, 1)
+        x1, y1, x2, y2 = plate_bbox
+        return [(x1 - xcar1) / car_width, (y1 - ycar1) / car_height,
+                (x2 - xcar1) / car_width, (y2 - ycar1) / car_height]
 
-    #     gray_smooth = cv.GaussianBlur(gray, (5, 5), 0)
-        
-    #     # tophat_w = max(5, int(w_car * 0.08)) 
-    #     # tophat_h = max(3, int(h_car * 0.04))
-        
-    #     # tophat_kernel = cv.getStructuringElement(cv.MORPH_RECT, (tophat_w, tophat_h))
-    #     tophat_kernel = cv.getStructuringElement(cv.MORPH_RECT, (15, 5))
-    #     tophat = cv.morphologyEx(gray_smooth, cv.MORPH_TOPHAT, tophat_kernel)
-    #     blurred = cv.GaussianBlur(tophat, (5, 5), 0)
-    #     sobel_x = cv.Sobel(blurred, cv.CV_8U, dx=1, dy=0, ksize=3)
-        
-    #     _, threshed = cv.threshold(sobel_x, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
-        
-    #     noise_kill_kernel = cv.getStructuringElement(cv.MORPH_RECT, (1, 3))
-    #     pruned_threshed = cv.morphologyEx(threshed, cv.MORPH_OPEN, noise_kill_kernel)
+    def project_bbox(self, vehicle_bbox, rel_bbox):
+        """Put a relative plate box back on a vehicle box, the plate is bolted to
+        the car so it follows the vehicle track without running the detector."""
+        xcar1, ycar1, xcar2, ycar2 = vehicle_bbox
+        car_width = xcar2 - xcar1
+        car_height = ycar2 - ycar1
+        rx1, ry1, rx2, ry2 = rel_bbox
+        return [xcar1 + rx1 * car_width, ycar1 + ry1 * car_height,
+                xcar1 + rx2 * car_width, ycar1 + ry2 * car_height]
 
-    #     dynamic_kernel = cv.getStructuringElement(cv.MORPH_RECT, (kernel_w, kernel_h))
-    #     # closed = cv.morphologyEx(threshed, cv.MORPH_CLOSE, dynamic_kernel)
-    #     closed = cv.morphologyEx(pruned_threshed, cv.MORPH_CLOSE, dynamic_kernel)
+    def plate_is_lost(self, plate_track, plate_bbox, frame_num, frame_size):
+        """A projected plate box stops being trustworthy when it collapses, leaves
+        the frame, was anchored on a weak detection or went unseen for too long."""
+        frame_width, frame_height = frame_size
+        x1, y1, x2, y2 = plate_bbox
 
-    #     clean_kernel = cv.getStructuringElement(cv.MORPH_RECT, (3, 3))
-    #     closed = cv.morphologyEx(closed, cv.MORPH_OPEN, clean_kernel)
-    #     #غيرت ال closed ساويتو متل ال image_debugger
-    #     contours, _ = cv.findContours(closed, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-        
-    #     roi_center_x = w_car / 2.0
-        
-    #     candidates = []
+        # the projection is unusable, only the detector can put the track back
+        if x2 - x1 < 1 or y2 - y1 < 1:
+            return True
 
-    #     for contour in contours:
-    #         x, y, w, h = cv.boundingRect(contour)
-    #         box_area = w * h
-            
-    #         if h == 0 or box_area == 0:
-    #             continue
-            
-    #         if box_area < min_plate_area or box_area > max_plate_area:
-    #             continue
-                
-    #         aspect_ratio = float(w) / h
-    #         if aspect_ratio < 1.2 or aspect_ratio > 6.0:
-    #             continue
-                
-    #         actual_contour_area = cv.contourArea(contour)
-    #         extent = float(actual_contour_area) / box_area
-            
-    #         if extent <= 0.45:
-    #             continue
+        if x2 <= 0 or y2 <= 0 or x1 >= frame_width or y1 >= frame_height:
+            return True
 
-    #         box_center_x = x + (w / 2.0)
-    #         distance_from_center_x = abs(roi_center_x - box_center_x)
-            
-    #         s_hx = max(0, 1.0 - (distance_from_center_x / roi_center_x)) 
-            
-    #         box_center_y = y + (h / 2.0)
-    #         s_vy = box_center_y / h_car 
+        if frame_num - plate_track['last_seen'] > self.max_lost_frames:
+            return True
 
-    #         edge_roi = threshed[y:y+h, x:x+w]
-    #         white_pixels = cv.countNonZero(edge_roi)
-    #         density_ratio = white_pixels / box_area
-    #         s_density = min(1.0, density_ratio * 2.5) 
+        # a weak anchor is worth one detector run, after that the ocr carries on
+        # alone instead of paying for the detector on every single frame
+        return plate_track['confidence'] < self.min_plate_confidence and not plate_track.get('redetected', False)
 
-    #         score = box_area * extent * s_density * (s_hx * s_vy)
-            
-    #         candidates.append({
-    #             'box': (x, y, w, h),
-    #             'score': score
-    #         })
-                
-    #     if not candidates:
-    #         return None
-            
-    #     best_candidate = sorted(candidates, key=lambda k: k['score'], reverse=True)[0]
-    #     return best_candidate['box']
+    # =========================================================
+    # BATCHED DETECTION (من المهمة الأولى)
+    # =========================================================
+    def detect_plates_for_frame(self, car_rois):
+        """
+        تعالج قائمة من car ROIs دفعة واحدة لاكتشاف اللوحات.
+        car_rois: list of numpy arrays (car crops)
+        ترجع: list of tuples (x, y, w, h) أو None لكل ROI
+        """
+        results = []
+        for car_roi in car_rois:
+            plate_box = self.detect_plate_location_dynamic_guassanian(car_roi)
+            results.append(plate_box)
+        return results
+
+    # =========================================================
+    # SMART PLATE TRACKING — التتبع الذكي للوحة
+    # =========================================================
+    def track_plates_for_frame(self, frame, car_dict, frame_idx, frame_size):
+        """
+        التتبع الذكي للوحات: projection + re-detection + lost tracks.
+
+        car_dict: {track_id: {'bbox': [...], 'crop': np.array, 'cls_name': str}, ...}
+        returns: {track_id: plate_bbox أو None}
+        """
+        frame_width, frame_height = frame_size
+        results = {}
+        cars_to_detect = {}  # سيارات بحاجة لكشف جديد/إعادة
+
+        # ---------------------------------------------------------
+        # المرحلة 1: projection للوحات الموجودة (اللوحة "مسمرة" على السيارة)
+        # ---------------------------------------------------------
+        for track_id, car_info in car_dict.items():
+            car_bbox = car_info['bbox']
+
+            # سيارة جديدة — ما عندها مسار لوحة
+            if track_id not in self.car_to_plate:
+                cars_to_detect[track_id] = car_info
+                continue
+
+            plate_id = self.car_to_plate[track_id]
+            if plate_id not in self.plate_tracks:
+                cars_to_detect[track_id] = car_info
+                continue
+
+            plate_track = self.plate_tracks[plate_id]
+            projected_bbox = self.project_bbox(car_bbox, plate_track['rel_bbox'])
+
+            # إذا الـ projection ما بيطلع صحيح — نرجع نشغل الـ detector
+            if self.plate_is_lost(plate_track, projected_bbox, frame_idx, frame_size):
+                plate_track['status'] = 'lost'
+                plate_track['redetected'] = True
+                cars_to_detect[track_id] = car_info
+                continue
+
+            # Projection ناجح — حدث المسار بدون ما تشغل الـ detector
+            plate_track.update({
+                'bbox': projected_bbox,
+                'last_seen': frame_idx,
+                'status': 'active'
+            })
+            results[track_id] = projected_bbox
+
+        # ---------------------------------------------------------
+        # المرحلة 2: كشف اللوحات للسيارات المحتاجة فقط (re-detection)
+        # ---------------------------------------------------------
+        if cars_to_detect:
+            plate_rois = []
+            detect_order = []
+
+            for track_id, car_info in cars_to_detect.items():
+                crop = car_info['crop']
+                plate_roi, y_offset = self._crop_plate_roi(crop)
+                if plate_roi is not None:
+                    plate_rois.append(plate_roi)
+                    detect_order.append((track_id, car_info, y_offset))
+
+            if plate_rois:
+                detections = self.detect_plates_for_frame(plate_rois)
+
+                for (track_id, car_info, y_offset), plate_local_box in zip(detect_order, detections):
+                    if plate_local_box is None:
+                        continue
+
+                    px, py, pw, ph = plate_local_box
+                    x1_car, y1_car, _, _ = self._clip_bbox(frame, car_info['bbox'])
+                    plate_bbox = [
+                        x1_car + px,
+                        y1_car + y_offset + py,
+                        x1_car + px + pw,
+                        y1_car + y_offset + py + ph,
+                    ]
+
+                    # إنشاء مسار لوحة جديد إذا لسا ما عندو
+                    if track_id not in self.car_to_plate:
+                        plate_id = self.next_plate_id
+                        self.next_plate_id += 1
+                        self.car_to_plate[track_id] = plate_id
+                        self.plate_tracks[plate_id] = {
+                            'vehicle_id': track_id,
+                            'ocr_done': False,
+                            'ocr_attempts': 0,
+                            'redetected': False,
+                            'text': None,
+                            'text_conf': None,
+                        }
+
+                    plate_id = self.car_to_plate[track_id]
+                    plate_track = self.plate_tracks[plate_id]
+
+                    # حفظ الموقع النسبي (rel_bbox) — هاد سر التتبع
+                    rel_bbox = self.relative_bbox(car_info['bbox'], plate_bbox)
+
+                    plate_track.update({
+                        'bbox': plate_bbox,
+                        'rel_bbox': rel_bbox,
+                        'confidence': 0.5,  # الخوارزمية CV ما بتعطي confidence — قيمة افتراضية
+                        'last_seen': frame_idx,
+                        'status': 'active',
+                        'redetected': True
+                    })
+
+                    results[track_id] = plate_bbox
+
+        # ---------------------------------------------------------
+        # المرحلة 3: تنظيف المسارات الميتة (lost tracks)
+        # ---------------------------------------------------------
+        lost_cars = []
+        for track_id, plate_id in list(self.car_to_plate.items()):
+            if track_id not in car_dict:
+                # السيارة غابت — تحقق من مدة الغياب
+                if plate_id in self.plate_tracks:
+                    if frame_idx - self.plate_tracks[plate_id]['last_seen'] > self.max_lost_frames:
+                        lost_cars.append(track_id)
+
+        for track_id in lost_cars:
+            plate_id = self.car_to_plate.pop(track_id, None)
+            if plate_id in self.plate_tracks:
+                del self.plate_tracks[plate_id]
+
+        return results
+
+    def reset(self):
+        """تفريغ كلي لمسارات اللوحات عند إعادة تشغيل الفيديو"""
+        self.plate_tracks.clear()
+        self.car_to_plate.clear()
+        self.next_plate_id = 101
+
+    # =========================================================
+    # دوال مساعدة للتتبع
+    # =========================================================
+    def _crop_plate_roi(self, car_crop):
+        """يقتطع الجزء السفلي من صورة السيارة (حيث تقع اللوحة عادةً)."""
+        if car_crop is None or car_crop.size == 0:
+            return None, 0
+        h, w = car_crop.shape[:2]
+        y_offset = int(h * self.plate_roi_ratio)
+        return car_crop[y_offset:h, 0:w], y_offset
+
+    def _clip_bbox(self, frame, bbox):
+        """يرجع إحداثيات الـ bbox بعد قصّها لتطابق حدود الفريم."""
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        h, w, _ = frame.shape
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        return x1, y1, x2, y2
 
     def _calculate_projection_profile_transitions(self, edge_roi: np.ndarray, w: int, h: int) -> int:
         """
@@ -109,20 +241,20 @@ class PlateDetector:
         strip_y1, strip_y2 = int(h * 0.33), int(h * 0.66)
         if strip_y2 <= strip_y1:
             return 0 # حماية ضد الصناديق الصغيرة جداً
-            
+
         mid_strip = edge_roi[strip_y1:strip_y2, :]
         strip_h = strip_y2 - strip_y1
-        
+
         # جمع البكسلات البيضاء عمودياً لكل عمود في الشريحة
         col_sums = np.sum(mid_strip > 0, axis=0)
-        
+
         # يعتبر العمود جزءاً من حرف إذا كان 20% على الأقل من بكسلاته بيضاء
         col_binary = (col_sums > (strip_h * 0.2)).astype(np.uint8)
-        
+
         # حساب عدد الانتقالات
         transitions = np.sum(col_binary[:-1] != col_binary[1:])
         return transitions
-    
+
     def detect_plate_location_dynamic_guassanian(self, car_roi: np.ndarray) -> tuple | None:
         """
         الوظيفة: اكتشاف موقع اللوحة في الوقت الفعلي (Video Stream) بمعمارية نظيفة.
@@ -130,15 +262,15 @@ class PlateDetector:
         """
         if car_roi is None or car_roi.size == 0:
             return None
-            
+
         h_car, w_car = car_roi.shape[:2]
         car_area = w_car * h_car
         roi_center_x = w_car / 2.0
-        
+
         # تعريف أحجام الكيرنل ديناميكياً
         kernel_w = max(3, int(w_car * 0.035))
         kernel_h = max(2, int(h_car * 0.02))
-        
+
         min_plate_area = car_area * 0.005
         max_plate_area = car_area * 0.15
 
@@ -165,11 +297,11 @@ class PlateDetector:
         gray_smooth_b = cv.GaussianBlur(gray, (5, 5), 0)
         tophat_kernel = cv.getStructuringElement(cv.MORPH_RECT, (15, 5))
         tophat = cv.morphologyEx(gray_smooth_b, cv.MORPH_TOPHAT, tophat_kernel)
-        
+
         blurred_b = cv.GaussianBlur(tophat, (5, 5), 0)
         sobel_x = cv.Sobel(blurred_b, cv.CV_16S, dx=1, dy=0, ksize=3)
         abs_sobel_x = cv.convertScaleAbs(sobel_x)
-        
+
         _, threshed = cv.threshold(abs_sobel_x, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
 
         # ---------------------------------------------------------
@@ -181,17 +313,17 @@ class PlateDetector:
         for contour in contours:
             x, y, w, h = cv.boundingRect(contour)
             box_area = w * h
-            
+
             # 1. Hard Geometry Gates (بوابات الرفض الهندسية)
             if h < 3 or w < 3 or box_area == 0:
                 continue
             if box_area < min_plate_area or box_area > max_plate_area:
                 continue
-                
+
             actual_contour_area = cv.contourArea(contour)
             extent = float(actual_contour_area) / box_area
             aspect_ratio = float(w) / h
-            
+
             if aspect_ratio < 1.2 or aspect_ratio > 6.5:
                 continue
             if extent < 0.35:
@@ -201,7 +333,7 @@ class PlateDetector:
             edge_roi = threshed[y:y+h, x:x+w]
             white_pixels = cv.countNonZero(edge_roi)
             density_ratio = white_pixels / box_area
-            
+
             # قتل الصناديق الناعمة تماماً كالأسفلت وظلال السيارات
             if white_pixels < 15 or density_ratio < 0.08:
                 continue 
@@ -209,7 +341,7 @@ class PlateDetector:
             # ---------------------------------------------------------
             # Complex Scoring Functions (دوال التقييم الرياضية المتقدمة)
             # ---------------------------------------------------------
-            
+
             # أ. الميزات الهندسية (Shape)
             ar_score = np.exp(-((aspect_ratio - 3.5) ** 2) / 2.0)
             s_geo = ar_score * extent  
@@ -218,7 +350,7 @@ class PlateDetector:
             box_center_x = x + (w / 2.0)
             distance_from_center_x = abs(roi_center_x - box_center_x)
             s_hx = max(0, 1.0 - (distance_from_center_x / roi_center_x)) 
-            
+
             box_center_y = y + (h / 2.0)
             y_norm = box_center_y / h_car 
             s_vy = np.exp(-((y_norm - 0.65) ** 2) / 0.15) # دالة ذروة واسعة النطاق
@@ -228,7 +360,7 @@ class PlateDetector:
 
             # د. الانتظام النصي (Text Pattern Consistency)
             transitions = self._calculate_projection_profile_transitions(edge_roi, w, h)
-            
+
             if 8 <= transitions <= 20:
                 pattern_score = 1.0
             elif 5 <= transitions < 8 or 20 < transitions <= 28:
@@ -238,7 +370,7 @@ class PlateDetector:
 
             # هـ. الدمج الجدائي (Multiplicative Fusion)
             final_score = (s_geo * 1.5) * (s_hx * s_vy) * s_density * pattern_score
-            
+
             # ---------------------------------------------------------
             # Diagnostic Telemetry (نظام التشخيص والمراقبة)
             # ---------------------------------------------------------
@@ -249,16 +381,16 @@ class PlateDetector:
             print(f" ├─ Density (s_dens) : {s_density:.3f} | raw_ratio:{density_ratio:.3f}")
             print(f" ├─ Pattern (s_pat)  : {pattern_score:.3f} | transitions:{transitions}")
             print(f" └─ FINAL SCORE      : {final_score:.4f}\n")
-            
+
             candidates.append({
                 'box': (x, y, w, h),
                 'score': final_score
             })
-                
+
         # إرجاع أفضل مرشح إن وُجد
         if not candidates:
             return None
-            
+
         best_candidate = sorted(candidates, key=lambda k: k['score'], reverse=True)[0]
         return best_candidate['box']
 
@@ -270,13 +402,13 @@ class PlateDetector:
         """
         if car_roi is None or car_roi.size == 0:
             return None
-            
+
         h_car, w_car = car_roi.shape[:2]
         car_area = w_car * h_car
-        
+
         kernel_w = max(3, int(w_car * 0.035))
         kernel_h = max(2, int(h_car * 0.02))
-        
+
         min_plate_area = car_area * 0.005
         max_plate_area = car_area * 0.15
 
@@ -303,36 +435,36 @@ class PlateDetector:
         gray_smooth_b = cv.GaussianBlur(gray, (5, 5), 0)
         tophat_kernel = cv.getStructuringElement(cv.MORPH_RECT, (15, 5))
         tophat = cv.morphologyEx(gray_smooth_b, cv.MORPH_TOPHAT, tophat_kernel)
-        
+
         blurred_b = cv.GaussianBlur(tophat, (5, 5), 0)
         sobel_x = cv.Sobel(blurred_b, cv.CV_16S, dx=1, dy=0, ksize=3)
         abs_sobel_x = cv.convertScaleAbs(sobel_x)
-        
+
         _, threshed = cv.threshold(abs_sobel_x, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
 
         # ---------------------------------------------------------
         # Logic Gates: Filtering & Extraction
         # ---------------------------------------------------------
         contours, _ = cv.findContours(closed_contours_mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-        
+
         roi_center_x = w_car / 2.0
         candidates = []
 
         for contour in contours:
             x, y, w, h = cv.boundingRect(contour)
             box_area = w * h
-            
+
             # Hard Filters
             if h < 3 or w < 3 or box_area == 0:
                 continue
-            
+
             if box_area < min_plate_area or box_area > max_plate_area:
                 continue
-                
+
             actual_contour_area = cv.contourArea(contour)
             extent = float(actual_contour_area) / box_area
             aspect_ratio = float(w) / h
-            
+
             if aspect_ratio < 1.2 or aspect_ratio > 6.5:
                 continue
             if extent < 0.35:
@@ -349,22 +481,22 @@ class PlateDetector:
             box_center_x = x + (w / 2.0)
             distance_from_center_x = abs(roi_center_x - box_center_x)
             s_hx = max(0, 1.0 - (distance_from_center_x / roi_center_x)) 
-            
+
             box_center_y = y + (h / 2.0)
             s_vy = box_center_y / h_car
-            
+
 
             # 3. Texture & Pattern Features (from Pipeline B)
             edge_roi = threshed[y:y+h, x:x+w]
-            
+
             white_pixels = cv.countNonZero(edge_roi)
             density_ratio = white_pixels / box_area
             s_density = min(1.0, density_ratio * 2.5) 
-            
+
             # Zero-Crossings / Textual Consistency Check
             mid_row = edge_roi[h // 2, :] 
             transitions = np.sum(mid_row[:-1] != mid_row[1:])
-            
+
             pattern_score = 0.1
             if 8 <= transitions <= 18:
                 pattern_score = 1.0
@@ -376,15 +508,14 @@ class PlateDetector:
             # 4. Multiplicative Fusion
             safe_density = max(0.1, s_density)
             final_score = (s_geo * 1.5) * (s_hx * s_vy) * safe_density * pattern_score
-            
+
             candidates.append({
                 'box': (x, y, w, h),
                 'score': final_score
             })
-                
+
         if not candidates:
             return None
-            
+
         best_candidate = sorted(candidates, key=lambda k: k['score'], reverse=True)[0]
         return best_candidate['box']
-

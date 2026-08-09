@@ -1,5 +1,8 @@
+import os
+import pickle
 import time
-from utils import read_video, save_video
+
+from utils import iter_video_frames, get_video_fps, VideoWriterContext
 from detections import (
     CarDetection,
     CarTypeClassifier,
@@ -24,9 +27,12 @@ def load_mmr_labels(label_path):
 
 def main():
     start_time = time.time()
-    input_video_path = "input_videos/input_video1.mp4"
+    input_video_path = "input_videos/input_video4.mp4"
+    output_video_path = "output_videos/output_video38.mp4"
+    stub_path = "tracker_stubs/car_detection.pkl"
+    read_from_stub = False  # خليها True لو بدك تعيد الرسم بس من نتائج مخزّنة سابقاً بدون إعادة الكشف
 
-    video_frames, fps = read_video(input_video_path)
+    fps = get_video_fps(input_video_path)
 
     # 1. تهيئة مصنف نوع جسم السيارة
     type_classifier = CarTypeClassifier(
@@ -57,28 +63,64 @@ def main():
         compute_interval=5,
     )
 
-    # 4. تهيئة الكاشف الرئيسي وتمرير النماذج الثلاثة
+    # 4. تهيئة الكاشف الرئيسي وتمرير النماذج الثلاثة + كاشف اللوحة
     car_detector = CarDetection(
         model_path="models/yolo11n.pt",
         type_classifier=type_classifier,
         color_detector=color_detector,
         make_model_detector=mmr_detector,
-        plate_detector=PlateDetector(), 
+        plate_detector=PlateDetector(),
         confidence_threshold=0.55,
     )
 
-    # معالجة الفريمات والتتبع
-    car_detections = car_detector.detect_frames(
-        video_frames,
-        read_from_stub=False,
-        stub_path="tracker_stubs/car_detection.pkl",
-    )
+    # =====================================================
+    # تحميل نتائج كشف مخزّنة مسبقاً (اختياري) بدل إعادة تشغيل
+    # الموديلات على كل فريم من جديد
+    # =====================================================
+    cached_car_detections = None
+    if read_from_stub and os.path.exists(stub_path):
+        with open(stub_path, "rb") as f:
+            cached_car_detections = pickle.load(f)
 
-    # رسم النتائج وحفظ الفيديو والسجلات
-    output_frames = car_detector.draw_bboxes(video_frames, car_detections)
-    save_video(output_frames, output_path="output_videos/output_video1.2.mp4", fps=fps)
+    # =====================================================
+    # المعالجة الفعلية: فريم فريم (streaming)
+    # ما في ولا لحظة فيها الفيديو كامل محمّل بالذاكرة
+    # =====================================================
+    os.makedirs(os.path.dirname(output_video_path), exist_ok=True)
+    os.makedirs(os.path.dirname(stub_path), exist_ok=True)
 
-    car_detector.save_tracking_log("tracking_log27.json")
+    all_car_detections = []  # بيانات خفيفة بس (bboxes/labels)، مش صور — حجمها مهمل
+    writer = None
+    frame_idx = 0
+
+    for frame in iter_video_frames(input_video_path):
+        if writer is None:
+            h, w = frame.shape[:2]
+            writer = VideoWriterContext(output_video_path, fps, (w, h))
+
+        if cached_car_detections is not None:
+            car_list = cached_car_detections[frame_idx]
+        else:
+            # detect_frame بتعمل batching داخلياً لكل الموديلات
+            car_list = car_detector.detect_frame(frame, frame_idx)
+            all_car_detections.append(car_list)
+
+        car_detector.draw_frame(frame, car_list)  # رسم بالمكان (in-place)
+        writer.write(frame)
+
+        frame_idx += 1
+        # ملاحظة: ما في أي list فيها الفريمات نفسها — frame بيتحرر
+        # من الذاكرة تلقائياً بعد كل تكرار
+
+    if writer is not None:
+        writer.release()
+
+    # نخزّن نتائج الكشف (بيانات خفيفة) لو ما كنا عم نقرأ من stub أصلاً
+    if cached_car_detections is None:
+        with open(stub_path, "wb") as f:
+            pickle.dump(all_car_detections, f)
+
+    car_detector.save_tracking_log("tracking_log32.json")
 
     end_time = time.time()
     elapsed_time = end_time - start_time
@@ -87,10 +129,10 @@ def main():
 
     print("=" * 40)
     print(" Done!")
+    print(f" Total frames processed: {frame_idx}")
     print(f" Total execution time: {minutes} m {seconds:.2f} s ({elapsed_time:.2f} seconds total)")
     print("=" * 40)
 
 
 if __name__ == "__main__":
     main()
-

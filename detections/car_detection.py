@@ -9,6 +9,14 @@ VEHICLE_CLASSES = {"car", "truck", "bus", "motorcycle", "bicycle"}
 class CarDetection:
     CLASSIFIABLE_YOLO_CLASSES = {"car", "truck"}
 
+    # ألوان لكل سطر (B, G, R) — على مستوى الكلاس عشان تنعمل مشاركة بين draw_frame وdraw_bboxes
+    _DRAW_COLORS = {
+        "id": (255, 255, 255),      # أبيض
+        "type": (255, 200, 100),    # برتقالي فاتح
+        "mmr": (100, 255, 255),     # أصفر فاتح
+        "color": (150, 255, 150),   # أخضر فاتح
+    }
+
     def __init__(
         self,
         model_path,
@@ -50,15 +58,15 @@ class CarDetection:
             return x1, y1, x2, y2
 
     def _crop_plate_roi(self, car_crop):
-    
+
             if car_crop is None or car_crop.size == 0:
                 return None, 0
-    
+
             h, w = car_crop.shape[:2]
             y_offset = int(h * self.plate_roi_ratio)
             return car_crop[y_offset:h, 0:w], y_offset
 
-    
+
 
     def detect_frames(self, frames, read_from_stub=False, stub_path=None):
         if read_from_stub and stub_path is not None:
@@ -75,11 +83,23 @@ class CarDetection:
         return car_detections
 
     def detect_frame(self, frame, frame_idx):
+        """
+        معالجة الإطار الواحد بشكل مجمع (Batched) لكل الموديلات.
+        """
+        frame_height, frame_width = frame.shape[:2]
+
         results = self.model.track(
             frame, persist=True, iou=0.1, conf=self.confidence_threshold, verbose=False
         )[0]
         id_name_dict = results.names
         car_list = []
+
+        # =====================================================
+        # المرحلة 1: تجميع البيانات الأساسية لكل السيارات
+        # =====================================================
+        car_crops = {}      # track_id -> bbox (للباتشينج)
+        car_metadata = {}   # track_id -> metadata كاملة
+
 
         for box in results.boxes:
             bbox = box.xyxy.tolist()[0]
@@ -94,87 +114,81 @@ class CarDetection:
 
             crop = self._crop(frame, bbox)
 
-            final_type = "Unknown"
-            final_conf = 0.0
-            color_name = "Unknown"
-            color_vote = 0.0
-            make_model_name = "Unknown"
-            make_model_conf = 0.0
-            display_type = cls_name
+            if track_id != -1 and crop is not None:
+                car_crops[track_id] = bbox
+                car_metadata[track_id] = {
+                    'bbox': bbox,
+                    'cls_name': cls_name,
+                    'yolo_conf': yolo_conf,
+                    'crop': crop,
+                }
 
-            # 1. تصنيف نوع السيارة (Body Type)
-            if (
-                cls_name in self.CLASSIFIABLE_YOLO_CLASSES
-                and self.type_classifier is not None
-                and crop is not None
-            ):
-                (
-                    final_type,
-                    final_conf,
-                ) = self.type_classifier.classify_and_vote(
-                    crop, track_id, cls_name, frame_idx
-                )
 
-            # 2. تحديد لون السيارة
-            if self.color_detector is not None and crop is not None:
-                color_name, color_vote = self.color_detector.get_stable_color(
-                    track_id, crop, frame_idx
-                )
 
-            # 3. تحديد الشركة والموديل (Make & Model)
-            if self.make_model_detector is not None and crop is not None:
-                (
-                    make_model_name,
-                    make_model_conf,
-                ) = self.make_model_detector.get_stable_make_model(
-                    track_id, crop, frame_idx
-                )
+        # =====================================================
+        # المرحلة 2: استدعاء الموديلات بشكل مجمع (Batched)
+        # =====================================================
 
-            # =====================================================
-            # Plate Detection (if applicable)
-            # =====================================================
-            plate_bbox = None
-            if (
-                cls_name in self.CLASSIFIABLE_YOLO_CLASSES
-                and self.plate_detector is not None
-                and crop is not None
-            ):
-                plate_roi, y_offset = self._crop_plate_roi(crop)
-                # plate_local_box = self.plate_detector.detect_plate_location_dynamic(plate_roi)
-                plate_local_box = self.plate_detector.detect_plate_location_dynamic_guassanian(plate_roi)
+        # 1. تحديد لون السيارة (Batched)
+        colors = {}
+        if self.color_detector is not None and car_crops:
+            colors = self.color_detector.get_stable_colors_for_frame(
+                frame, car_crops, frame_idx
+            )
 
-                if plate_local_box is not None:
-                    px, py, pw, ph = plate_local_box
-                    x1_car, y1_car, _, _ = self._clip_bbox(frame, bbox)
-                    plate_bbox = [
-                        x1_car + px,
-                        y1_car + y_offset + py,
-                        x1_car + px + pw,
-                        y1_car + y_offset + py + ph,
-                    ]
+        # 2. تصنيف نوع جسم السيارة (Batched)
+        types = {}
+        if self.type_classifier is not None and car_crops:
+            cls_name_dict = {tid: car_metadata[tid]['cls_name'] for tid in car_crops}
+            types = self.type_classifier.classify_and_vote_for_frame(
+                frame, car_crops, cls_name_dict, frame_idx
+            )
+
+        # 3. تحديد الشركة والموديل (Batched)
+        mmrs = {}
+        if self.make_model_detector is not None and car_crops:
+            mmrs = self.make_model_detector.get_stable_make_models_for_frame(
+                frame, car_crops, frame_idx
+            )
+
+        # 4. اكتشاف اللوحات (Smart Tracking: projection + re-detection + lost tracks)
+        # بدل ما نكشف اللوحة بكل فريم، نتبعها بـ projection ونعيد الكشف بس لما تضيع
+        plates = {}
+        if self.plate_detector is not None and car_crops:
+            plates = self.plate_detector.track_plates_for_frame(
+                frame, car_metadata, frame_idx, (frame_width, frame_height)
+            )
+
+        # =====================================================
+        # المرحلة 3: بناء قائمة النتائج النهائية
+        # =====================================================
+        for track_id, meta in car_metadata.items():
+            color_name, color_vote = colors.get(track_id, ("Unknown", 0.0))
+            final_type, final_conf = types.get(track_id, ("Unknown", 0.0))
+            make_model_name, make_model_conf = mmrs.get(track_id, ("Unknown", 0.0))
+            plate_bbox = plates.get(track_id, None)
 
             # تسجيل البيانات في السجل Log
-            if track_id != -1:
-                self._log_prediction(
-                    track_id,
-                    frame_idx,
-                    cls_name,
-                    yolo_conf,
-                    final_type,
-                    final_conf,
-                    color_name,
-                    color_vote,
-                    make_model_name,
-                    make_model_conf,
-                    plate_bbox,
-                )
+            self._log_prediction(
+                track_id,
+                frame_idx,
+                meta['cls_name'],
+                meta['yolo_conf'],
+                final_type,
+                final_conf,
+                color_name,
+                color_vote,
+                make_model_name,
+                make_model_conf,
+                plate_bbox,
+            )
 
             car_list.append(
                 {
-                    "bbox": bbox,
+                    "bbox": meta['bbox'],
                     "track_id": track_id,
-                    "yolo_class": cls_name,
-                    "yolo_conf": yolo_conf,
+                    "yolo_class": meta['cls_name'],
+                    "yolo_conf": meta['yolo_conf'],
                     "type_name": final_type,
                     "type_conf": final_conf,
                     "color_name": color_name,
@@ -237,113 +251,117 @@ class CarDetection:
             }
         )
 
-    def draw_bboxes(self, video_frames, car_detections):
+    # =====================================================
+    # دوال الرسم — النسخة الجديدة (streaming) + القديمة (batch)
+    # =====================================================
+    @staticmethod
+    def _draw_label(frame, text, x, y, bg_color, font_scale=0.45, thickness=1):
         """
-        يرسم البوكسات والمعلومات فوق كل سيارة بنفس منطق test_tracking_video.py
-        - خلفية ملونة خلف كل سطر
-        - outline رفيع حول النص للوضوح
-        - ألوان مختلفة لكل نوع معلومات
+        ترسم خلفية ملونة + outline أسود رفيع + نص داكن.
+        نسخة static method مشتركة بين draw_frame و draw_bboxes.
         """
-        # ألوان لكل سطر (B, G, R)
-        COLORS = {
-            "id": (255, 255, 255),      # أبيض
-            "type": (255, 200, 100),    # برتقالي فاتح
-            "mmr": (100, 255, 255),     # أصفر فاتح
-            "color": (150, 255, 150),   # أخضر فاتح
-        }
+        (text_w, text_h), _ = cv.getTextSize(
+            text, cv.FONT_HERSHEY_SIMPLEX, font_scale, thickness
+        )
+        # نتأكد ما يطلع النص فوق الشاشة
+        y = max(y, text_h + 6)
 
-        def _draw_label(frame, text, x, y, bg_color, font_scale=0.45, thickness=1):
-            """
-            نسخة من draw_label تبع test_tracking_video.py
-            ترسم خلفية ملونة + outline أسود رفيع + نص داكن
-            """
-            (text_w, text_h), _ = cv.getTextSize(
-                text, cv.FONT_HERSHEY_SIMPLEX, font_scale, thickness
-            )
-            # نتأكد ما يطلع النص فوق الشاشة
-            y = max(y, text_h + 6)
+        pad = 4
+        # 1. الخلفية الملونة
+        cv.rectangle(
+            frame,
+            (x, y - text_h - pad),
+            (x + text_w + pad * 2, y + pad),
+            bg_color,
+            -1,  # fill
+        )
 
-            pad = 4
-            # 1. الخلفية الملونة
+        # 2. outline أسود (رفيع) للوضوح
+        cv.putText(
+            frame, text, (x + pad, y - 2),
+            cv.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness + 1, cv.LINE_AA
+        )
+        # 3. النص الأصلي
+        cv.putText(
+            frame, text, (x + pad, y - 2),
+            cv.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness, cv.LINE_AA
+        )
+
+    def draw_frame(self, frame, car_list):
+        """
+        يرسم البوكسات والمعلومات فوق فريم واحد بس (بالمكان، in-place) ويرجّعه.
+        هاي هي الدالة يلي بتستخدمها المعالجة الـ streaming (فريم فريم) بدل تجميع
+        كل الفريمات بالذاكرة أول ما بتخلص المعالجة.
+        """
+        COLORS = self._DRAW_COLORS
+
+        for detection in car_list:
+            x1, y1, x2, y2 = detection["bbox"]
+            track_id = detection["track_id"]
+
+            # نجهز الأسطر يلي بدنا نرسمن
+            lines = []
+
+            # السطر الأول: ID + صنف YOLO
+            id_prefix = f"ID:{track_id} | " if track_id != -1 else ""
+            lines.append((f"{id_prefix}{detection['yolo_class']} ({detection['yolo_conf']:.2f})", COLORS["id"]))
+
+            # السطر الثاني: النوع (Type)
+            lines.append((f"Type: {detection['type_name']} ({detection['type_conf']:.2f})", COLORS["type"]))
+
+            # السطر الثالث: Make & Model (بس إذا مش Unknown)
+            if detection.get("make_model_name") and detection["make_model_name"] != "Unknown":
+                lines.append((f"MMR: {detection['make_model_name']} ({detection['make_model_conf']:.2f})", COLORS["mmr"]))
+
+            # السطر الرابع: اللون
+            lines.append((f"Color: {detection['color_name']} ({detection['color_conf']:.2f})", COLORS["color"]))
+
+            # نحسب ارتفاع كل سطر
+            line_height = 18
+            total_height = len(lines) * line_height + 4
+
+            # نحدد موقع البداية (فوق البوكس)
+            start_y = int(y1) - total_height
+
+            # إذا ما فيش مساحة فوق البوكس، نرسم تحتو
+            if start_y < 10:
+                start_y = int(y2) + 18
+
+            # نرسم كل سطر
+            current_y = start_y
+            for text, color in lines:
+                self._draw_label(frame, text, int(x1), current_y, color)
+                current_y += line_height
+
+            # نرسم البوكس تبع السيارة
             cv.rectangle(
                 frame,
-                (x, y - text_h - pad),
-                (x + text_w + pad * 2, y + pad),
-                bg_color,
-                -1,  # fill
+                (int(x1), int(y1)),
+                (int(x2), int(y2)),
+                (0, 255, 255),  # أصفر سماوي
+                2,
             )
 
-            # 2. outline أسود (رفيع) للوضوح
-            cv.putText(
-                frame, text, (x + pad, y - 2),
-                cv.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness + 1, cv.LINE_AA
-            )
-            # 3. النص الأصلي
-            cv.putText(
-                frame, text, (x + pad, y - 2),
-                cv.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness, cv.LINE_AA
-            )
+            # =====================================================
+            # Plate Detection Drawing
+            # =====================================================
+            if detection.get("plate_bbox") is not None:
+                px1, py1, px2, py2 = [int(v) for v in detection["plate_bbox"]]
+                cv.rectangle(frame, (px1, py1), (px2, py2), (0, 0, 255), 2)
+                self._draw_label(frame, "Plate", px1, py1 - 4, (0, 0, 255))
 
+        return frame
+
+    def draw_bboxes(self, video_frames, car_detections):
+        """
+        نسخة الدفعة (batch) القديمة — بتاخد كل الفريمات دفعة وحدة وبترجع كل شي مرسوم.
+        محفوظة لأي كود قديم عم يعتمد عليها. تحتها بتستخدم draw_frame لكل فريم
+        (نفس النتيجة بالضبط متل قبل، بس بدون تكرار الكود).
+        """
         output_frames = []
-
         for frame, car_list in zip(video_frames, car_detections):
-            for detection in car_list:
-                x1, y1, x2, y2 = detection["bbox"]
-                track_id = detection["track_id"]
-
-                # نجهز الأسطر يلي بدنا نرسمن
-                lines = []
-
-                # السطر الأول: ID + صنف YOLO
-                id_prefix = f"ID:{track_id} | " if track_id != -1 else ""
-                lines.append((f"{id_prefix}{detection['yolo_class']} ({detection['yolo_conf']:.2f})", COLORS["id"]))
-
-                # السطر الثاني: النوع (Type)
-                lines.append((f"Type: {detection['type_name']} ({detection['type_conf']:.2f})", COLORS["type"]))
-
-                # السطر الثالث: Make & Model (بس إذا مش Unknown)
-                if detection.get("make_model_name") and detection["make_model_name"] != "Unknown":
-                    lines.append((f"MMR: {detection['make_model_name']} ({detection['make_model_conf']:.2f})", COLORS["mmr"]))
-
-                # السطر الرابع: اللون
-                lines.append((f"Color: {detection['color_name']} ({detection['color_conf']:.2f})", COLORS["color"]))
-
-                # نحسب ارتفاع كل سطر
-                line_height = 18
-                total_height = len(lines) * line_height + 4
-
-                # نحدد موقع البداية (فوق البوكس)
-                start_y = int(y1) - total_height
-
-                # إذا ما فيش مساحة فوق البوكس، نرسم تحتو
-                if start_y < 10:
-                    start_y = int(y2) + 18
-
-                # نرسم كل سطر
-                current_y = start_y
-                for text, color in lines:
-                    _draw_label(frame, text, int(x1), current_y, color)
-                    current_y += line_height
-
-                # نرسم البوكس تبع السيارة
-                cv.rectangle(
-                    frame,
-                    (int(x1), int(y1)),
-                    (int(x2), int(y2)),
-                    (0, 255, 255),  # أصفر سماوي
-                    2,
-                )
-                
-                # =====================================================
-                # Plate Detection Drawing
-                # =====================================================
-                if detection.get("plate_bbox") is not None:
-                    px1, py1, px2, py2 = [int(v) for v in detection["plate_bbox"]]
-                    cv.rectangle(frame, (px1, py1), (px2, py2), (0, 0, 255), 2)
-                    _draw_label(frame, "Plate", px1, py1 - 4, (0, 0, 255))
-
+            self.draw_frame(frame, car_list)
             output_frames.append(frame)
-
         return output_frames
 
     def save_tracking_log(self, output_path="tracking_log.json"):
