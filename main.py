@@ -28,8 +28,8 @@ def load_mmr_labels(label_path):
 
 def main():
     start_time = time.time()
-    input_video_path = "input_videos/input_video4.mp4"
-    output_video_path = "output_videos/output_video38.mp4"
+    input_video_path = "input_videos/input_video1.mp4"
+    output_video_path = "output_videos/output_video1.5.mp4"
     stub_path = "tracker_stubs/car_detection.pkl"
     read_from_stub = False  # خليها True لو بدك تعيد الرسم بس من نتائج مخزّنة سابقاً بدون إعادة الكشف
     PLATE_BACKEND = "cv"  # "cv" أو "yolo" — OCR يشتغل على المسارين (retry كل 5 فريمات)

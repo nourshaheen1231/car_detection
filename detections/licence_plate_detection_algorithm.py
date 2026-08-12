@@ -489,16 +489,16 @@ class PlateDetector:
             # هـ. الدمج الجدائي (Multiplicative Fusion)
             final_score = (s_geo * 1.5) * (s_hx * s_vy) * s_density * pattern_score
 
-            # ---------------------------------------------------------
-            # Diagnostic Telemetry (نظام التشخيص والمراقبة)
-            # ---------------------------------------------------------
-            print(f"[CANDIDATE BOX] x:{x}, y:{y}, w:{w}, h:{h}")
-            print(f" ├─ Shape (s_geo)    : {s_geo:.3f} | ar:{aspect_ratio:.2f}, extent:{extent:.2f}")
-            print(f" ├─ X-Pos (s_hx)     : {s_hx:.3f} | dist_from_center:{distance_from_center_x:.1f}")
-            print(f" ├─ Y-Pos (s_vy)     : {s_vy:.3f} | y_norm:{y_norm:.2f}")
-            print(f" ├─ Density (s_dens) : {s_density:.3f} | raw_ratio:{density_ratio:.3f}")
-            print(f" ├─ Pattern (s_pat)  : {pattern_score:.3f} | transitions:{transitions}")
-            print(f" └─ FINAL SCORE      : {final_score:.4f}\n")
+            # # ---------------------------------------------------------
+            # # Diagnostic Telemetry (نظام التشخيص والمراقبة)
+            # # ---------------------------------------------------------
+            # print(f"[CANDIDATE BOX] x:{x}, y:{y}, w:{w}, h:{h}")
+            # print(f" ├─ Shape (s_geo)    : {s_geo:.3f} | ar:{aspect_ratio:.2f}, extent:{extent:.2f}")
+            # print(f" ├─ X-Pos (s_hx)     : {s_hx:.3f} | dist_from_center:{distance_from_center_x:.1f}")
+            # print(f" ├─ Y-Pos (s_vy)     : {s_vy:.3f} | y_norm:{y_norm:.2f}")
+            # print(f" ├─ Density (s_dens) : {s_density:.3f} | raw_ratio:{density_ratio:.3f}")
+            # print(f" ├─ Pattern (s_pat)  : {pattern_score:.3f} | transitions:{transitions}")
+            # print(f" └─ FINAL SCORE      : {final_score:.4f}\n")
 
             candidates.append({
                 'box': (x, y, w, h),
