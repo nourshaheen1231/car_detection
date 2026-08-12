@@ -19,3 +19,6 @@ tracker_stubs/*
 !output_videos/.gitkeep
 !input_videos/.gitkeep
 !tracker_stubs/.gitkeep
+
+__pycache__/
+*.pyc
