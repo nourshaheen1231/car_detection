@@ -88,6 +88,7 @@ class CarDetection:
         """
         frame_height, frame_width = frame.shape[:2]
 
+        # تتبع السيارات: ByteTrack الافتراضي (مش BoT-SORT) — ثابت عبر persist=True
         results = self.model.track(
             frame, persist=True, iou=0.1, conf=self.confidence_threshold, verbose=False
         )[0]
@@ -129,14 +130,22 @@ class CarDetection:
         # المرحلة 2: استدعاء الموديلات بشكل مجمع (Batched)
         # =====================================================
 
-        # 1. تحديد لون السيارة (Batched)
+        # 1. اكتشاف اللوحات (Smart Tracking: projection + re-detection + lost tracks)
+        # بدل ما نكشف اللوحة بكل فريم، نتبعها بـ projection ونعيد الكشف بس لما تضيع
+        plates = {}
+        if self.plate_detector is not None and car_crops:
+            plates = self.plate_detector.track_plates_for_frame(
+                frame, car_metadata, frame_idx, (frame_width, frame_height)
+            )
+
+        # 2. تحديد لون السيارة (Batched)
         colors = {}
         if self.color_detector is not None and car_crops:
             colors = self.color_detector.get_stable_colors_for_frame(
                 frame, car_crops, frame_idx
             )
 
-        # 2. تصنيف نوع جسم السيارة (Batched)
+        # 3. تصنيف نوع جسم السيارة (Batched)
         types = {}
         if self.type_classifier is not None and car_crops:
             cls_name_dict = {tid: car_metadata[tid]['cls_name'] for tid in car_crops}
@@ -144,20 +153,14 @@ class CarDetection:
                 frame, car_crops, cls_name_dict, frame_idx
             )
 
-        # 3. تحديد الشركة والموديل (Batched)
+        # 4. تحديد الشركة والموديل (Batched)
         mmrs = {}
         if self.make_model_detector is not None and car_crops:
             mmrs = self.make_model_detector.get_stable_make_models_for_frame(
                 frame, car_crops, frame_idx
             )
 
-        # 4. اكتشاف اللوحات (Smart Tracking: projection + re-detection + lost tracks)
-        # بدل ما نكشف اللوحة بكل فريم، نتبعها بـ projection ونعيد الكشف بس لما تضيع
-        plates = {}
-        if self.plate_detector is not None and car_crops:
-            plates = self.plate_detector.track_plates_for_frame(
-                frame, car_metadata, frame_idx, (frame_width, frame_height)
-            )
+
 
         # =====================================================
         # المرحلة 3: بناء قائمة النتائج النهائية
@@ -167,6 +170,17 @@ class CarDetection:
             final_type, final_conf = types.get(track_id, ("Unknown", 0.0))
             make_model_name, make_model_conf = mmrs.get(track_id, ("Unknown", 0.0))
             plate_bbox = plates.get(track_id, None)
+
+            # الربط سيارة ↔ لوحة (مثل suliman: vehicle_to_plate)
+            plate_track_id = None
+            plate_text = None
+            plate_text_conf = None
+            if self.plate_detector is not None:
+                plate_track_id = self.plate_detector.car_to_plate.get(track_id)
+                if plate_track_id is not None:
+                    pt = self.plate_detector.plate_tracks.get(plate_track_id, {})
+                    plate_text = pt.get("text")
+                    plate_text_conf = pt.get("text_conf")
 
             # تسجيل البيانات في السجل Log
             self._log_prediction(
@@ -181,6 +195,9 @@ class CarDetection:
                 make_model_name,
                 make_model_conf,
                 plate_bbox,
+                plate_track_id,
+                plate_text,
+                plate_text_conf,
             )
 
             car_list.append(
@@ -196,6 +213,9 @@ class CarDetection:
                     "make_model_name": make_model_name,
                     "make_model_conf": make_model_conf,
                     "plate_bbox": plate_bbox,
+                    "plate_track_id": plate_track_id,
+                    "plate_text": plate_text,
+                    "plate_text_conf": plate_text_conf,
                 }
             )
 
@@ -223,7 +243,10 @@ class CarDetection:
         color_vote,
         make_model_name,
         make_model_conf,
-        plate_bbox=None, 
+        plate_bbox=None,
+        plate_track_id=None,
+        plate_text=None,
+        plate_text_conf=None,
     ):
         if track_id not in self.tracking_log:
             self.tracking_log[track_id] = []
@@ -248,6 +271,11 @@ class CarDetection:
                 if make_model_conf is not None
                 else 0.0,
                 "plate_bbox": plate_bbox,
+                "plate_track_id": plate_track_id,
+                "plate_text": plate_text,
+                "plate_text_conf": round(plate_text_conf, 3)
+                if plate_text_conf is not None
+                else None,
             }
         )
 
@@ -348,7 +376,13 @@ class CarDetection:
             if detection.get("plate_bbox") is not None:
                 px1, py1, px2, py2 = [int(v) for v in detection["plate_bbox"]]
                 cv.rectangle(frame, (px1, py1), (px2, py2), (0, 0, 255), 2)
-                self._draw_label(frame, "Plate", px1, py1 - 4, (0, 0, 255))
+                plate_text = detection.get("plate_text")
+                if plate_text:
+                    plate_label = str(plate_text)
+                else:
+                    plate_id = detection.get("plate_track_id")
+                    plate_label = f"Plate:{plate_id}" if plate_id is not None else "Plate"
+                self._draw_label(frame, plate_label, px1, py1 - 4, (0, 0, 255))
 
         return frame
 

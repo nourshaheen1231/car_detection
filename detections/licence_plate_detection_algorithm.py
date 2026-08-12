@@ -2,28 +2,63 @@ import cv2 as cv
 import pickle
 import numpy as np
 import os
-from ultralytics import YOLO
+
+from .plate_ocr import read_license_plates
+
 
 class PlateDetector:
 
-    def __init__(self, max_lost_frames=5, plate_roi_ratio=0.45, min_plate_confidence=0.3):
+    def __init__(
+        self,
+        max_lost_frames=5,
+        plate_roi_ratio=0.45,
+        min_plate_confidence=0.3,
+        enable_ocr=True,
+        ocr_retry_interval=5,
+        plate_padding=3,
+    ):
         """
-        تهيئة كاشف اللوحة مع دعم التتبع الذكي (Projection + Re-detection).
+        تهيئة كاشف اللوحة (خوارزمية CV) مع دعم التتبع الذكي (Projection + Re-detection).
 
         Args:
             max_lost_frames: عدد الفريمات الأقصى قبل اعتبار اللوحة مفقودة
             plate_roi_ratio: نسبة القص لأخذ الجزء السفلي من السيارة
             min_plate_confidence: أدنى ثقة مقبولة لمسار اللوحة
+            enable_ocr: تشغيل قراءة نص اللوحة (PaddleOCR) بعد تثبيت الموقع
+            ocr_retry_interval: عدد الفريمات بين محاولات OCR عند فشل القراءة
+            plate_padding: هامش قص اللوحة من الفريم قبل OCR
         """
         self.max_lost_frames = max_lost_frames
         self.plate_roi_ratio = plate_roi_ratio
         self.min_plate_confidence = min_plate_confidence
+        self.enable_ocr = enable_ocr
+        self.ocr_retry_interval = ocr_retry_interval
+        self.plate_padding = plate_padding
 
         # تتبع اللوحات: {plate_track_id: {rel_bbox, confidence, last_seen, status, ...}}
         self.plate_tracks = {}
         # ربط السيارة باللوحة: {car_track_id: plate_track_id}
         self.car_to_plate = {}
         self.next_plate_id = 101
+
+        # إحصائيات مرئية للتيست: CV detector vs projection
+        self.last_frame_stats = {
+            "cv_detect_calls": 0,
+            "cv_cars_inferred": 0,
+            "projected_car_ids": [],
+            "detect_car_ids": [],
+            "redetect_car_ids": [],
+        }
+    def _new_plate_track(self, vehicle_id):
+        return {
+            "vehicle_id": vehicle_id,
+            "ocr_done": False,
+            "ocr_attempts": 0,
+            "last_ocr_frame": -10**9,
+            "redetected": False,
+            "text": None,
+            "text_conf": None,
+        }
 
     # =========================================================
     # دوال التتبع الأساسية (من شغل الزميل الأول)
@@ -72,14 +107,18 @@ class PlateDetector:
     # =========================================================
     def detect_plates_for_frame(self, car_rois):
         """
-        تعالج قائمة من car ROIs دفعة واحدة لاكتشاف اللوحات.
+        تعالج قائمة من car ROIs دفعة واحدة لاكتشاف اللوحات (خوارزمية CV).
         car_rois: list of numpy arrays (car crops)
-        ترجع: list of tuples (x, y, w, h) أو None لكل ROI
+        ترجع: list of tuples (x, y, w, h, conf) أو None لكل ROI
         """
         results = []
         for car_roi in car_rois:
             plate_box = self.detect_plate_location_dynamic_guassanian(car_roi)
-            results.append(plate_box)
+            if plate_box is None:
+                results.append(None)
+            else:
+                x, y, w, h = plate_box
+                results.append((x, y, w, h, 0.5))
         return results
 
     # =========================================================
@@ -92,7 +131,14 @@ class PlateDetector:
         car_dict: {track_id: {'bbox': [...], 'crop': np.array, 'cls_name': str}, ...}
         returns: {track_id: plate_bbox أو None}
         """
-        frame_width, frame_height = frame_size
+        self.last_frame_stats = {
+            "cv_detect_calls": 0,
+            "cv_cars_inferred": 0,
+            "projected_car_ids": [],
+            "detect_car_ids": [],
+            "redetect_car_ids": [],
+        }
+
         results = {}
         cars_to_detect = {}  # سيارات بحاجة لكشف جديد/إعادة
 
@@ -105,11 +151,13 @@ class PlateDetector:
             # سيارة جديدة — ما عندها مسار لوحة
             if track_id not in self.car_to_plate:
                 cars_to_detect[track_id] = car_info
+                self.last_frame_stats["detect_car_ids"].append(track_id)
                 continue
 
             plate_id = self.car_to_plate[track_id]
             if plate_id not in self.plate_tracks:
                 cars_to_detect[track_id] = car_info
+                self.last_frame_stats["detect_car_ids"].append(track_id)
                 continue
 
             plate_track = self.plate_tracks[plate_id]
@@ -120,6 +168,7 @@ class PlateDetector:
                 plate_track['status'] = 'lost'
                 plate_track['redetected'] = True
                 cars_to_detect[track_id] = car_info
+                self.last_frame_stats["redetect_car_ids"].append(track_id)
                 continue
 
             # Projection ناجح — حدث المسار بدون ما تشغل الـ detector
@@ -129,6 +178,7 @@ class PlateDetector:
                 'status': 'active'
             })
             results[track_id] = projected_bbox
+            self.last_frame_stats["projected_car_ids"].append(track_id)
 
         # ---------------------------------------------------------
         # المرحلة 2: كشف اللوحات للسيارات المحتاجة فقط (re-detection)
@@ -145,13 +195,15 @@ class PlateDetector:
                     detect_order.append((track_id, car_info, y_offset))
 
             if plate_rois:
+                self.last_frame_stats["cv_detect_calls"] = 1
+                self.last_frame_stats["cv_cars_inferred"] = len(plate_rois)
                 detections = self.detect_plates_for_frame(plate_rois)
 
                 for (track_id, car_info, y_offset), plate_local_box in zip(detect_order, detections):
                     if plate_local_box is None:
                         continue
 
-                    px, py, pw, ph = plate_local_box
+                    px, py, pw, ph, plate_conf = plate_local_box
                     x1_car, y1_car, _, _ = self._clip_bbox(frame, car_info['bbox'])
                     plate_bbox = [
                         x1_car + px,
@@ -165,14 +217,7 @@ class PlateDetector:
                         plate_id = self.next_plate_id
                         self.next_plate_id += 1
                         self.car_to_plate[track_id] = plate_id
-                        self.plate_tracks[plate_id] = {
-                            'vehicle_id': track_id,
-                            'ocr_done': False,
-                            'ocr_attempts': 0,
-                            'redetected': False,
-                            'text': None,
-                            'text_conf': None,
-                        }
+                        self.plate_tracks[plate_id] = self._new_plate_track(track_id)
 
                     plate_id = self.car_to_plate[track_id]
                     plate_track = self.plate_tracks[plate_id]
@@ -183,7 +228,7 @@ class PlateDetector:
                     plate_track.update({
                         'bbox': plate_bbox,
                         'rel_bbox': rel_bbox,
-                        'confidence': 0.5,  # الخوارزمية CV ما بتعطي confidence — قيمة افتراضية
+                        'confidence': plate_conf,
                         'last_seen': frame_idx,
                         'status': 'active',
                         'redetected': True
@@ -207,7 +252,80 @@ class PlateDetector:
             if plate_id in self.plate_tracks:
                 del self.plate_tracks[plate_id]
 
+        # ---------------------------------------------------------
+        # المرحلة 4: OCR مشترك (قص اللوحة من الفريم + batch واحد)
+        # ---------------------------------------------------------
+        self._run_ocr_for_active_plates(frame, frame_idx, frame_size, results)
+
         return results
+
+    # =========================================================
+    # SHARED OCR — قص اللوحة من الفريم ثم قراءة batched
+    # =========================================================
+    def _should_run_ocr(self, plate_track, frame_idx):
+        if not self.enable_ocr:
+            return False
+        if plate_track.get("ocr_done", False):
+            return False
+        last_ocr = plate_track.get("last_ocr_frame", -10**9)
+        return (frame_idx - last_ocr) >= self.ocr_retry_interval
+
+    def _crop_plate_from_frame(self, frame, plate_bbox, frame_size):
+        frame_width, frame_height = frame_size
+        x1 = max(0, int(plate_bbox[0]) - self.plate_padding)
+        y1 = max(0, int(plate_bbox[1]) - self.plate_padding)
+        x2 = min(frame_width, int(plate_bbox[2]) + self.plate_padding)
+        y2 = min(frame_height, int(plate_bbox[3]) + self.plate_padding)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        crop = frame[y1:y2, x1:x2]
+        if crop is None or crop.size == 0:
+            return None
+        return crop
+
+    def _run_ocr_for_active_plates(self, frame, frame_idx, frame_size, active_results):
+        """
+        active_results: {car_track_id: plate_bbox} للوحات الظاهرة هذا الفريم.
+        يجمع crops المستحقة ثم يشغّل PaddleOCR مرة واحدة للفريم.
+        """
+        if not self.enable_ocr or not active_results:
+            return
+
+        plate_crops = []
+        plate_ids = []
+
+        for track_id, plate_bbox in active_results.items():
+            plate_id = self.car_to_plate.get(track_id)
+            if plate_id is None or plate_id not in self.plate_tracks:
+                continue
+
+            plate_track = self.plate_tracks[plate_id]
+            if not self._should_run_ocr(plate_track, frame_idx):
+                continue
+
+            crop = self._crop_plate_from_frame(frame, plate_bbox, frame_size)
+            if crop is None:
+                continue
+
+            plate_crops.append(crop)
+            plate_ids.append(plate_id)
+
+        if not plate_crops:
+            return
+
+        ocr_results = read_license_plates(plate_crops)
+
+        for plate_id, (text, text_conf) in zip(plate_ids, ocr_results):
+            plate_track = self.plate_tracks[plate_id]
+            plate_track["ocr_attempts"] = plate_track.get("ocr_attempts", 0) + 1
+            plate_track["last_ocr_frame"] = frame_idx
+
+            if text is None:
+                continue
+
+            plate_track["text"] = text
+            plate_track["text_conf"] = text_conf
+            plate_track["ocr_done"] = True
 
     def reset(self):
         """تفريغ كلي لمسارات اللوحات عند إعادة تشغيل الفيديو"""

@@ -9,6 +9,7 @@ from detections import (
     CarColorDetection,
     CarMakeModelDetection,
     PlateDetector,
+    YoloPlateDetector,
 )
 
 
@@ -31,6 +32,7 @@ def main():
     output_video_path = "output_videos/output_video38.mp4"
     stub_path = "tracker_stubs/car_detection.pkl"
     read_from_stub = False  # خليها True لو بدك تعيد الرسم بس من نتائج مخزّنة سابقاً بدون إعادة الكشف
+    PLATE_BACKEND = "cv"  # "cv" أو "yolo" — OCR يشتغل على المسارين (retry كل 5 فريمات)
 
     fps = get_video_fps(input_video_path)
 
@@ -63,13 +65,21 @@ def main():
         compute_interval=5,
     )
 
-    # 4. تهيئة الكاشف الرئيسي وتمرير النماذج الثلاثة + كاشف اللوحة
+    # 4. تهيئة كاشف اللوحة حسب الاختيار
+    if PLATE_BACKEND == "yolo":
+        plate_detector = YoloPlateDetector(
+            model_path="models/license-plate-finetune-v1n.pt",
+        )
+    else:
+        plate_detector = PlateDetector()
+
+    # 5. تهيئة الكاشف الرئيسي وتمرير النماذج الثلاثة + كاشف اللوحة
     car_detector = CarDetection(
         model_path="models/yolo11n.pt",
         type_classifier=type_classifier,
         color_detector=color_detector,
         make_model_detector=mmr_detector,
-        plate_detector=PlateDetector(),
+        plate_detector=plate_detector,
         confidence_threshold=0.55,
     )
 
