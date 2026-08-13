@@ -1,8 +1,6 @@
 import os
-import pickle
 import time
 
-from utils import iter_video_frames, get_video_fps, VideoWriterContext
 from detections import (
     CarDetection,
     CarTypeClassifier,
@@ -28,15 +26,19 @@ def load_mmr_labels(label_path):
 
 def main():
     start_time = time.time()
-    input_video_path = "input_videos/input_video1.mp4"
-    output_video_path = "output_videos/output_video1.5.mp4"
+    
+    # 1. إعداد المسارات والمتغيرات الثابتة
+    input_video_path = "input_videos/input_video14.mp4"
+    output_video_path = "output_videos/output_video14.mp4"
     stub_path = "tracker_stubs/car_detection.pkl"
-    read_from_stub = False  # خليها True لو بدك تعيد الرسم بس من نتائج مخزّنة سابقاً بدون إعادة الكشف
-    PLATE_BACKEND = "cv"  # "cv" أو "yolo" — OCR يشتغل على المسارين (retry كل 5 فريمات)
+    read_from_stub = False  # خليها True لو بدك تعيد الرسم بس من نتائج مخزّنة سابقاً
+    PLATE_BACKEND = "cv"    # "cv" أو "yolo"
 
-    fps = get_video_fps(input_video_path)
+    # التأكد من وجود مسارات الإخراج
+    os.makedirs(os.path.dirname(output_video_path), exist_ok=True)
+    os.makedirs(os.path.dirname(stub_path), exist_ok=True)
 
-    # 1. تهيئة مصنف نوع جسم السيارة
+    # 2. تهيئة مصنف نوع جسم السيارة
     type_classifier = CarTypeClassifier(
         model_path="models/car_body_type_classifier.pt",
         class_map_path="models/idx_to_class.json",
@@ -45,7 +47,7 @@ def main():
         compute_interval=5,
     )
 
-    # 2. تهيئة مكتشف لون السيارة
+    # 3. تهيئة مكتشف لون السيارة
     color_detector = CarColorDetection(
         model_path="models/Car_Color_Detection.keras",
         history_size=15,
@@ -54,7 +56,7 @@ def main():
         compute_interval=5,
     )
 
-    # 3. تهيئة مكتشف ماركة وموديل السيارة (MMR)
+    # 4. تهيئة مكتشف ماركة وموديل السيارة (MMR)
     labels = load_mmr_labels("models/mmr-labels.txt")
     mmr_detector = CarMakeModelDetection(
         model_path="models/Car_MMR_Detection.mnn",
@@ -65,7 +67,7 @@ def main():
         compute_interval=5,
     )
 
-    # 4. تهيئة كاشف اللوحة حسب الاختيار
+    # 5. تهيئة كاشف اللوحة حسب الاختيار
     if PLATE_BACKEND == "yolo":
         plate_detector = YoloPlateDetector(
             model_path="models/license-plate-finetune-v1n.pt",
@@ -73,7 +75,7 @@ def main():
     else:
         plate_detector = PlateDetector()
 
-    # 5. تهيئة الكاشف الرئيسي وتمرير النماذج الثلاثة + كاشف اللوحة
+    # 6. تهيئة الكاشف الرئيسي وتمرير النماذج الثلاثة + كاشف اللوحة
     car_detector = CarDetection(
         model_path="models/yolo11n.pt",
         type_classifier=type_classifier,
@@ -84,54 +86,20 @@ def main():
     )
 
     # =====================================================
-    # تحميل نتائج كشف مخزّنة مسبقاً (اختياري) بدل إعادة تشغيل
-    # الموديلات على كل فريم من جديد
+    # المعالجة الفعلية: الاستدعاء الجديد (Streaming)
     # =====================================================
-    cached_car_detections = None
-    if read_from_stub and os.path.exists(stub_path):
-        with open(stub_path, "rb") as f:
-            cached_car_detections = pickle.load(f)
+    print("Starting video processing stream...")
+    car_detector.process_streaming(
+        input_video_path=input_video_path,
+        output_video_path=output_video_path,
+        read_from_stub=read_from_stub,
+        stub_path=stub_path,
+    )
 
-    # =====================================================
-    # المعالجة الفعلية: فريم فريم (streaming)
-    # ما في ولا لحظة فيها الفيديو كامل محمّل بالذاكرة
-    # =====================================================
-    os.makedirs(os.path.dirname(output_video_path), exist_ok=True)
-    os.makedirs(os.path.dirname(stub_path), exist_ok=True)
-
-    all_car_detections = []  # بيانات خفيفة بس (bboxes/labels)، مش صور — حجمها مهمل
-    writer = None
-    frame_idx = 0
-
-    for frame in iter_video_frames(input_video_path):
-        if writer is None:
-            h, w = frame.shape[:2]
-            writer = VideoWriterContext(output_video_path, fps, (w, h))
-
-        if cached_car_detections is not None:
-            car_list = cached_car_detections[frame_idx]
-        else:
-            # detect_frame بتعمل batching داخلياً لكل الموديلات
-            car_list = car_detector.detect_frame(frame, frame_idx)
-            all_car_detections.append(car_list)
-
-        car_detector.draw_frame(frame, car_list)  # رسم بالمكان (in-place)
-        writer.write(frame)
-
-        frame_idx += 1
-        # ملاحظة: ما في أي list فيها الفريمات نفسها — frame بيتحرر
-        # من الذاكرة تلقائياً بعد كل تكرار
-
-    if writer is not None:
-        writer.release()
-
-    # نخزّن نتائج الكشف (بيانات خفيفة) لو ما كنا عم نقرأ من stub أصلاً
-    if cached_car_detections is None:
-        with open(stub_path, "wb") as f:
-            pickle.dump(all_car_detections, f)
-
+    # حفظ سجل التتبع النهائي
     car_detector.save_tracking_log("tracking_log32.json")
 
+    # حساب وطباعة وقت التنفيذ
     end_time = time.time()
     elapsed_time = end_time - start_time
     minutes = int(elapsed_time // 60)
@@ -139,7 +107,6 @@ def main():
 
     print("=" * 40)
     print(" Done!")
-    print(f" Total frames processed: {frame_idx}")
     print(f" Total execution time: {minutes} m {seconds:.2f} s ({elapsed_time:.2f} seconds total)")
     print("=" * 40)
 

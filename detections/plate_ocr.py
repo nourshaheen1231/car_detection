@@ -81,26 +81,15 @@ def format_license(text):
     return license_plate_
 
 
-def pick_license_plate(detected_chars, min_fallback_score=0.5):
-    """Pick the best OCR candidate.
-
-    أولوية أولى: نص يطابق الفورمات الصارم (license_complies_format) — هاد الأدق.
-    لكن إذا ولا نص طابق الفورمات (وهو المتوقع لو الفورمات المكوّد ما بينطبق
-    على لوحاتك الفعلية)، منرجع أعلى نص بالثقة بدل ما نرجع None دايمًا —
-    هاد يلي كان يسبب plate_text=null بشكل دائم بغض النظر شو تقرأ الـ OCR.
-    """
-    best_raw_text, best_raw_score = None, None
+def pick_license_plate(detected_chars):
+    """Pick the first OCR candidate that matches the plate format."""
 
     for text, score in detected_chars:
         text = text.upper().replace(" ", "")
+
         if license_complies_format(text):
             return format_license(text), score
-        if best_raw_score is None or score > best_raw_score:
-            best_raw_text, best_raw_score = text, score
-
-    if best_raw_text is not None and best_raw_score >= min_fallback_score:
-        return best_raw_text, best_raw_score
-
+        
     return None, None
 
 
