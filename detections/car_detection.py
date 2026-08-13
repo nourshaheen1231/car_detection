@@ -718,6 +718,118 @@ class CarDetection:
             json.dump(snapshot, f, ensure_ascii=False, indent=2)
         print(f"Saved {len(snapshot)} vehicles to: {output_path}")
 
+
+    
+    # =========================================================
+    # FINALIZE & EXPORT (Post-Processing — بعد انتهاء الفيديو)
+    # =========================================================
+    def finalize_tracking_log(self, per_field_best=True):
+        """
+        يبني تقرير نهائي (JSON-ready) من الـ tracking_log الخام.
+
+        Logic:
+          1. فلترة OCR: استبعد أي track_id ما عنده ولا frame فيه plate_text صالح.
+          2. لكل سيارة متبقية:
+             - لو per_field_best=True:  كل حقل (plate/type/color/mmr) بيجي من الإطار
+               يلي فيه أعلى confidence لهاد الحقل بالتحديد.
+             - لو per_field_best=False: بيختار إطار واحد (الأعلى بـ plate_conf)
+               وبيسحب كل الحقول منو.
+          3. بيرجع dict جاهز للـ JSON / Backend.
+
+        ملاحظة: هاي الدالة بتشتغل على الذاكرة فقط (O(n))، وبتستدعى بعد
+        stop() لما كل الـ threads تكون ميتة — فما في حاجة لـ locks إضافية.
+        """
+        # ناخد snapshot من الـ log (defensive — لو اتصلت قبل ما يقفل)
+        with self._log_lock:
+            raw_log = {
+                tid: list(entries) for tid, entries in self.tracking_log.items()
+            }
+
+        final_report = {}
+
+        for track_id, frames in raw_log.items():
+            if not frames:
+                continue
+
+            # ── 1. فلترة OCR: لازم يكون فيه frame واحد على الأقل فيه plate_text ──
+            valid_frames = [
+                f for f in frames
+                if f.get("plate_text") and str(f["plate_text"]).strip()
+            ]
+            if not valid_frames:
+                continue  # ← استبعد السيارة بالكامل
+
+            if per_field_best:
+                # ── 2a. Per-field best: كل حقل من أفضل إطار له ──
+                best_plate = max(
+                    valid_frames,
+                    key=lambda f: f.get("plate_text_conf") or 0.0
+                )
+                best_type = max(
+                    frames,
+                    key=lambda f: f.get("type_confidence") or 0.0
+                )
+                best_color = max(
+                    frames,
+                    key=lambda f: f.get("color_vote_ratio") or 0.0
+                )
+                best_mmr = max(
+                    frames,
+                    key=lambda f: f.get("make_model_confidence") or 0.0
+                )
+
+                entry = {
+                    "track_id": track_id,
+                    "plate_text": best_plate["plate_text"],
+                    "plate_conf": best_plate["plate_text_conf"],
+                    "type": best_type["predicted_type"],
+                    "type_conf": best_type["type_confidence"],
+                    "color": best_color["smoothed_color"],
+                    "color_conf": best_color["color_vote_ratio"],
+                    "make_model": best_mmr["make_model"],
+                    "make_model_conf": best_mmr["make_model_confidence"],
+                    "first_seen_frame": frames[0]["frame"],
+                    "last_seen_frame": frames[-1]["frame"],
+                    "total_frames_seen": len(frames),
+                    "valid_frames_with_ocr": len(valid_frames),
+                }
+            else:
+                # ── 2b. Single best frame: أعلى plate_conf، كل الحقول منو ──
+                best = max(
+                    valid_frames,
+                    key=lambda f: f.get("plate_text_conf") or 0.0
+                )
+                entry = {
+                    "track_id": track_id,
+                    "plate_text": best["plate_text"],
+                    "plate_conf": best["plate_text_conf"],
+                    "type": best["predicted_type"],
+                    "type_conf": best["type_confidence"],
+                    "color": best["smoothed_color"],
+                    "color_conf": best["color_vote_ratio"],
+                    "make_model": best["make_model"],
+                    "make_model_conf": best["make_model_confidence"],
+                    "best_frame": best["frame"],
+                    "first_seen_frame": frames[0]["frame"],
+                    "last_seen_frame": frames[-1]["frame"],
+                    "total_frames_seen": len(frames),
+                    "valid_frames_with_ocr": len(valid_frames),
+                }
+
+            final_report[f"vehicle_{track_id}"] = entry
+
+        return final_report
+
+    def save_final_report(self, output_path="final_report.json", per_field_best=True):
+        """
+        يبني التقرير النهائي ويحفظو كـ JSON.
+        """
+        report = self.finalize_tracking_log(per_field_best=per_field_best)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        print(f"[FINALIZE] Saved {len(report)} vehicles to: {output_path}")
+        return report
+
     # =========================================================
     # DRAWING (unchanged logic, isolated)
     # =========================================================

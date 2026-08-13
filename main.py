@@ -29,7 +29,7 @@ def main():
     
     # 1. إعداد المسارات والمتغيرات الثابتة
     input_video_path = "input_videos/input_video14.mp4"
-    output_video_path = "output_videos/output_video14.mp4"
+    output_video_path = "output_videos/output_video14.2.mp4"
     stub_path = "tracker_stubs/car_detection.pkl"
     read_from_stub = False  # خليها True لو بدك تعيد الرسم بس من نتائج مخزّنة سابقاً
     PLATE_BACKEND = "cv"    # "cv" أو "yolo"
@@ -104,6 +104,14 @@ def main():
     elapsed_time = end_time - start_time
     minutes = int(elapsed_time // 60)
     seconds = elapsed_time % 60
+
+    # car_detector.save_tracking_log("tracking_log_raw.json")
+    
+    # 2. ابني التقرير النهائي وابعته
+    final_report = car_detector.save_final_report(
+        output_path="final_report.json",
+        per_field_best=True   # ← كل حقل من أفضل إطار له
+    )
 
     print("=" * 40)
     print(" Done!")
