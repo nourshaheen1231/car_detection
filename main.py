@@ -28,7 +28,7 @@ def main():
     start_time = time.time()
     
     input_video_path = "input_videos/input_video14.mp4"
-    output_video_path = "output_videos/output_video14.7.mp4"
+    output_video_path = "output_videos/output_video14.8.mp4"
     stub_path = "tracker_stubs/car_detection.pkl"
     read_from_stub = False  
     PLATE_BACKEND = "cv"    # "cv" أو "yolo"
@@ -70,7 +70,8 @@ def main():
         plate_detector = PlateDetector()
 
     car_detector = CarDetection(
-        model_path="models/yolo11n.pt",
+        # model_path="models/yolo11n.pt",
+        model_path="models/yolo11n_openvino_model",
         type_classifier=type_classifier,
         color_detector=color_detector,
         make_model_detector=mmr_detector,
