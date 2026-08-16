@@ -1,4 +1,3 @@
-"""PaddleOCR helpers for license plate text (from suliman project, trimmed)."""
 
 import os
 import string
@@ -82,7 +81,6 @@ def format_license(text):
 
 
 def pick_license_plate(detected_chars):
-    """Pick the first OCR candidate that matches the plate format."""
 
     for text, score in detected_chars:
         text = text.upper().replace(" ", "")

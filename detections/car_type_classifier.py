@@ -26,7 +26,6 @@ class CarTypeClassifier:
             idx_to_class = json.load(f)
         self.idx_to_class = {int(k): v for k, v in idx_to_class.items()}
 
-        # FIX: infer num_classes from checkpoint, not JSON
         state_dict = torch.load(model_path, map_location=self.device)
         num_classes = state_dict['classifier.1.weight'].shape[0]
 
@@ -50,15 +49,9 @@ class CarTypeClassifier:
             )
         ])
 
-    # ===============================
     # BATCHED FRAME-LEVEL CLASSIFICATION
-    # ===============================
     def classify_and_vote_for_frame(self, frame, car_dict, cls_name_dict, frame_idx):
-        """
-        تصنيف نوع جسم السيارة بشكل مجمع لكل الإطار.
-        car_dict: {track_id: bbox, ...}
-        cls_name_dict: {track_id: cls_name, ...} (للتوافق مع الاستخدام الحالي)
-        """
+
         if not car_dict:
             return {}
 
@@ -90,11 +83,8 @@ class CarTypeClassifier:
         final_results.update(cached_results)
         return final_results
 
-    # ===============================
     # BACKWARD COMPATIBILITY
-    # ===============================
     def classify_and_vote(self, crop, track_id, cls_name, frame_idx):
-        """للتوافق مع الاستدعاءات القديمة — تستدعي النسخة المجمعة"""
         if track_id == -1:
             return self.predict(crop)
 
@@ -104,11 +94,8 @@ class CarTypeClassifier:
         result = self.classify_and_vote_for_frame(crop, {track_id: bbox}, cls_dict, frame_idx)
         return result.get(track_id, ("Unknown", 0.0))
 
-    # ===============================
     # BUILD CROPS — Batched
-    # ===============================
     def _build_all_crops(self, frame, car_dict):
-        """تبني كل الـ crops للسيارات دفعة واحدة."""
         ordered_ids = list(car_dict.keys())
         per_car_crops = []
         crop_counts = []
@@ -121,18 +108,14 @@ class CarTypeClassifier:
         return per_car_crops, crop_counts, ordered_ids
 
     def _build_crops(self, frame, bbox):
-        """تبني crop واحد لسيارة واحدة (PyTorch tensor)."""
         base = self._crop_roi(frame, bbox)
         if base is None:
             return []
 
         return [self._preprocess(base)]
 
-    # ===============================
     # BATCHED PREDICTION
-    # ===============================
     def _run_batched_prediction(self, frame, car_dict, per_car_crops, crop_counts, ordered_ids):
-        """تشغيل النموذج بشكل مجمع على كل الـ crops."""
         raw_results = {}
 
         if not per_car_crops:
@@ -140,7 +123,6 @@ class CarTypeClassifier:
                 raw_results[track_id] = ("Unknown", 0.0)
             return raw_results
 
-        # تجميع الـ tensors بـ batch واحد
         batch = torch.stack(per_car_crops, dim=0).to(self.device)
 
         with torch.no_grad():
@@ -170,11 +152,8 @@ class CarTypeClassifier:
 
         return raw_results
 
-    # ===============================
     # TEMPORAL SMOOTHING (Weighted Voting)
-    # ===============================
     def _update_history_and_vote(self, raw_results):
-        """تحديث التاريخ والتصويت الزمني لكل السيارات."""
         stable_types = {}
 
         for track_id, (label, confidence) in raw_results.items():
@@ -190,7 +169,6 @@ class CarTypeClassifier:
                 stable_types[track_id] = ("Unknown", 0.0)
                 continue
 
-            # حساب التصويت الموزون
             weighted_scores = {}
             for lbl, conf in buffer:
                 weighted_scores[lbl] = weighted_scores.get(lbl, 0.0) + conf
@@ -199,7 +177,6 @@ class CarTypeClassifier:
             total_weight = sum(weighted_scores.values())
             vote_ratio = weighted_scores[smoothed_label] / total_weight
 
-            # تطبيق المنطق الذكي الموحد
             if vote_ratio >= 0.5:
                 final_type = smoothed_label
                 final_conf = vote_ratio
@@ -210,7 +187,6 @@ class CarTypeClassifier:
                 final_type = "Unknown"
                 final_conf = 0.0
 
-            # تحديث الكاش
             self._type_cache[track_id] = {
                 "final_type": final_type,
                 "final_conf": final_conf
@@ -220,9 +196,7 @@ class CarTypeClassifier:
 
         return stable_types
 
-    # ===============================
     # SINGLE PREDICTION (Backward compatibility)
-    # ===============================
     def predict(self, crop):
         if crop is None or crop.size == 0:
             return "Unknown", 0.0
@@ -241,9 +215,7 @@ class CarTypeClassifier:
 
         return raw_label, confidence
 
-    # ===============================
     # CROP + PREPROCESS
-    # ===============================
     def _crop_roi(self, frame, bbox):
         x1, y1, x2, y2 = map(int, bbox)
         x1, y1 = max(x1, 0), max(y1, 0)
@@ -256,13 +228,9 @@ class CarTypeClassifier:
         pil_img = Image.fromarray(crop_rgb)
         return self.transform(pil_img)
 
-    # ===============================
     # CLEANUP
-    # ===============================
     def cleanup_inactive_tracks(self, current_frame_idx):
-        """
-        يحذف بيانات السيارات التي غابت عن الشاشة لفترة تتجاوز max_lost_frames
-        """
+       
         lost_ids = []
 
         for tid, last_frame in list(self.last_seen_frame.items()):
@@ -279,7 +247,6 @@ class CarTypeClassifier:
             del self.last_seen_frame[tid]
 
     def reset(self):
-        """تفريغ كلي لجميع القواميس عند إعادة تشغيل الفيديو"""
         self._type_cache.clear()
         self._frame_counters.clear()
         self.vote_buffer.clear()

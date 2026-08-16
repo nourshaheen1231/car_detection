@@ -39,25 +39,18 @@ class CarColorDetection:
         self._frame_counters = {}
         self._kmeans_cache = {}
 
-        self.last_seen_frame = {}  # لتخزين رقم آخر فريم ظهرت فيه كل سيارة
-        self.max_lost_frames = 120  # فترة السماح (مثلاً 120 فريم = 4 ثواني تقريباً)
+        self.last_seen_frame = {}  
+        self.max_lost_frames = 120  
 
-        # عتبات KMeans fallback
         self.kmeans_conf_threshold = 0.5
         self.kmeans_sample_size = 500
 
-    # ===============================
     # MAIN FUNCTION — Frame-level Batching
-    # ===============================
     def get_stable_colors_for_frame(self, frame, car_dict: dict, frame_idx: int):
-        """
-        تعالج كل السيارات الموجودة بالإطار دفعة واحدة (Batched).
-        car_dict: {track_id: bbox, ...}
-        """
+       
         if not car_dict:
             return {}
 
-        # تحديث العدادات وآخر فريم مشاهدة
         needs_compute = []
         cached_results = {}
 
@@ -66,52 +59,39 @@ class CarColorDetection:
             self.last_seen_frame[track_id] = frame_idx
 
             current_count = self._frame_counters[track_id]
-            # إذا الكاش موجود والفاصل الزمني ما وصل، رجع الكاش مباشرة
             if track_id in self._color_cache and current_count % self.compute_interval != 0:
                 cached = self._color_cache[track_id]
                 cached_results[track_id] = (cached["color"], cached.get("confidence", 0.0))
             else:
                 needs_compute.append(track_id)
 
-        # إذا كل السيارات عندن كاش صالح، رجع الكاش
         if not needs_compute:
             return cached_results
 
-        # بني الـ crops للسيارات يلي بحاجة حساب
         compute_dict = {tid: car_dict[tid] for tid in needs_compute}
         per_car_crops, crop_counts, ordered_ids = self._build_all_crops(frame, compute_dict)
 
-        # تشغيل النموذج بشكل مجمع (Batched)
         raw_results = self._run_batched_prediction(
             frame, compute_dict, per_car_crops, crop_counts, ordered_ids
         )
 
-        # التصويت الزمني وتحديث الكاش
         final_results = self._update_history_and_vote(raw_results)
 
-        # دمج النتائج الجديدة مع الكاش القديم
         final_results.update(cached_results)
         return final_results
 
-    # ===============================
     # BACKWARD COMPATIBILITY
-    # ===============================
     def get_stable_color(self, track_id, crop, frame_idx):
-        """للتوافق مع الاستدعاءات القديمة — تستدعي النسخة المجمعة"""
         if track_id == -1:
             return self._predict_color(crop)
 
-        # نبني bbox وهمي من الـ crop (مش مثالي بس للتوافق)
         h, w = crop.shape[:2]
         bbox = [0, 0, w, h]
         result = self.get_stable_colors_for_frame(crop, {track_id: bbox}, frame_idx)
         return result.get(track_id, ("Unknown", 0.0))
 
-    # ===============================
     # BUILD CROPS — Batched
-    # ===============================
     def _build_all_crops(self, frame, car_dict):
-        """تبني كل الـ crops للسيارات دفعة واحدة."""
         ordered_ids = list(car_dict.keys())
         per_car_crops = []
         crop_counts = []
@@ -124,7 +104,6 @@ class CarColorDetection:
         return per_car_crops, crop_counts, ordered_ids
 
     def _build_crops(self, frame, bbox):
-        """تبني crop واحد أو أكثر (مع TTA) لسيارة واحدة."""
         base = self._crop_roi(frame, bbox)
         if base is None:
             return []
@@ -137,11 +116,8 @@ class CarColorDetection:
 
         return crops
 
-    # ===============================
     # BATCHED PREDICTION
-    # ===============================
     def _run_batched_prediction(self, frame, car_dict, per_car_crops, crop_counts, ordered_ids):
-        """تشغيل النموذج بشكل مجمع على كل الـ crops."""
         raw_results = {}
 
         if not per_car_crops:
@@ -167,9 +143,7 @@ class CarColorDetection:
             confidence = float(avg_pred[best_idx])
             color_name = self.CLASS_NAMES[best_idx]
 
-            # =========================================
-            # KMeans fallback (من تعديل زميل اللون)
-            # =========================================
+            # KMeans fallback 
             if confidence < self.kmeans_conf_threshold:
                 if track_id in self._kmeans_cache:
                     k_color, k_conf = self._kmeans_cache[track_id]
@@ -193,15 +167,11 @@ class CarColorDetection:
         return raw_results
 
     def _run_model(self, batch):
-        """تشغيل النموذج على batch من الصور."""
         output = self.model(batch, training=False)
         return output.numpy() if hasattr(output, "numpy") else np.asarray(output)
 
-    # ===============================
     # TEMPORAL SMOOTHING (Weighted Voting)
-    # ===============================
     def _update_history_and_vote(self, raw_results):
-        """تحديث التاريخ والتصويت الزمني لكل السيارات."""
         stable_colors = {}
 
         for track_id, (color, conf) in raw_results.items():
@@ -217,7 +187,6 @@ class CarColorDetection:
                 stable_colors[track_id] = ("Unknown", 0.0)
                 continue
 
-            # حساب التصويت بناءً على السجل
             weighted_scores = {}
             for c, confidence in history:
                 weighted_scores[c] = weighted_scores.get(c, 0.0) + confidence
@@ -226,7 +195,6 @@ class CarColorDetection:
             total_weight = sum(weighted_scores.values())
             vote_ratio = weighted_scores[final_color] / total_weight
 
-            # تطبيق المنطق الذكي الموحد
             if vote_ratio >= 0.5 and final_color != "Unknown":
                 final_color = final_color
                 final_conf = vote_ratio
@@ -237,7 +205,6 @@ class CarColorDetection:
                 final_color = "Unknown"
                 final_conf = 0.0
 
-            # تحديث الـ Cache بالنتيجة النهائية
             self._color_cache[track_id] = {
                 "color": final_color,
                 "confidence": final_conf
@@ -247,9 +214,7 @@ class CarColorDetection:
 
         return stable_colors
 
-    # ===============================
-    # FAST KMeans (من تعديل زميل اللون)
-    # ===============================
+    # FAST KMeans 
     def _predict_kmeans_fast(self, crop):
         lab = cv.cvtColor(crop, cv.COLOR_BGR2LAB)
         pixels = lab.reshape((-1, 3))
@@ -269,9 +234,7 @@ class CarColorDetection:
         color = self._lab_to_color_name(dominant)
         return color, confidence
 
-    # ===============================
     # COLOR PREDICTION (Backward compatibility)
-    # ===============================
     def _predict_color(self, crop):
         if crop is None or crop.size == 0:
             return "Unknown", 0.0
@@ -330,9 +293,7 @@ class CarColorDetection:
 
         return "grey"
 
-    # ===============================
     # CROP + PREPROCESS
-    # ===============================
     def _crop_roi(self, frame, bbox):
         x1, y1, x2, y2 = map(int, bbox)
         x1, y1 = max(x1, 0), max(y1, 0)
@@ -352,13 +313,9 @@ class CarColorDetection:
         arr = crop_resized.astype(np.float32) * self.rescale
         return np.expand_dims(arr, axis=0)
 
-    # ===============================
     # CLEANUP
-    # ===============================
     def cleanup_inactive_tracks(self, current_frame_idx):
-        """
-        يحذف بيانات السيارات التي غابت عن الشاشة لفترة تتجاوز max_lost_frames
-        """
+        
         lost_ids = []
 
         for tid, last_frame in list(self.last_seen_frame.items()):
@@ -377,7 +334,6 @@ class CarColorDetection:
             del self.last_seen_frame[tid]
 
     def reset(self):
-        """تفريغ كلي لجميع القواميس"""
         self._color_history.clear()
         self._color_cache.clear()
         self._frame_counters.clear()

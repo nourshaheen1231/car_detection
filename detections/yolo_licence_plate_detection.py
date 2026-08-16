@@ -4,13 +4,7 @@ from .licence_plate_detection_algorithm import PlateDetector
 
 
 class YoloPlateDetector(PlateDetector):
-    """
-    كاشف لوحات بموديل YOLO بنفس أسلوب suliman project:
-    - الكشف على crop السيارة الكامل
-    - اختيار أفضل لوحة + projection / re-detection
-    - OCR مشترك من PlateDetector (قص اللوحة من الفريم + batch)
-    """
-
+   
     _PLATE_CONF_BUCKET = 0.1
 
     def __init__(
@@ -31,12 +25,11 @@ class YoloPlateDetector(PlateDetector):
             plate_padding=plate_padding,
         )
         self.model = YOLO(model_path)
-        # إحصائيات للتحقق من تخفيف استدعاء الموديل
         self.stats = {
-            "model_batch_calls": 0,   # كم مرة اشتغل YOLO اللوحة
-            "model_cars_inferred": 0, # كم سيارة انبعتت للموديل
-            "projected": 0,           # كم مرة اكتفينا بـ projection
-            "redetect_queued": 0,     # كم سيارة رجعت لكشف بسبب lost
+            "model_batch_calls": 0,   
+            "model_cars_inferred": 0, 
+            "projected": 0,           
+            "redetect_queued": 0,     
         }
         self.last_frame_stats = {
             "model_batch_calls": 0,
@@ -47,7 +40,6 @@ class YoloPlateDetector(PlateDetector):
         }
 
     def _best_plate(self, plates):
-        """أعلى ثقة تفوز؛ عند التعادل (ضمن bucket) نأخذ الأوطى y2 — نفس suliman."""
         return max(
             plates,
             key=lambda plate: (
@@ -57,10 +49,7 @@ class YoloPlateDetector(PlateDetector):
         )
 
     def detect_plates_for_frame(self, car_rois):
-        """
-        كشف اللوحات بموديل YOLO على قائمة car crops كاملة دفعة واحدة.
-        ترجع: list of (x1, y1, x2, y2, conf) بإحداثيات داخل الـ crop، أو None.
-        """
+        
         if not car_rois:
             return []
 
@@ -90,10 +79,7 @@ class YoloPlateDetector(PlateDetector):
         return results
 
     def track_plates_for_frame(self, frame, car_dict, frame_idx, frame_size):
-        """
-        كشف/تتبع موقع اللوحة بأسلوب suliman ثم OCR المشترك batched.
-        returns: {track_id: plate_bbox [x1,y1,x2,y2] بإحداثيات الفريم}
-        """
+        
         self.last_frame_stats = {
             "model_batch_calls": 0,
             "model_cars_inferred": 0,

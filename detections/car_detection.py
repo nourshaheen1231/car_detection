@@ -45,33 +45,31 @@ class CarDetection:
         self.tracking_log = {}
         self._log_lock = threading.Lock()
 
-        # ── Producer-Consumer Queue Architecture ──
+        # Producer-Consumer Queue Architecture 
         self._analysis_queue = queue.Queue(maxsize=30)
         self._result_queue = queue.Queue(maxsize=30)
         self._stop_event = threading.Event()
         self._worker_thread = None
         self._writer_thread = None
 
-        # ── ThreadPool for parallel analysis (color / type / mmr) ──
+        # ThreadPool for parallel analysis (color / type / mmr) 
         self._executor = ThreadPoolExecutor(
             max_workers=3, thread_name_prefix="Analyzer"
         )
 
-        # ── Thread-safety lock for OCR reader (defensive) ──
+        # Thread-safety lock for OCR reader (defensive) 
         self._ocr_lock = threading.Lock()
 
-        # ── Profiling / Instrumentation (thread-safe) ──
+        # Profiling / Instrumentation (thread-safe)
         self._stats_lock = threading.Lock()
-        self._stats = defaultdict(list)            # stage_name -> [durations بالثانية]
-        self._thread_names = defaultdict(set)        # stage_name -> {أسماء الـ threads يلي نفذوها فعليًا}
+        self._stats = defaultdict(list)            
+        self._thread_names = defaultdict(set)        
         self._queue_depth_samples = {
             "analysis_queue": deque(maxlen=2000),
             "result_queue": deque(maxlen=2000),
         }
 
-    # =========================================================
     # PUBLIC API: Streaming Entry Point
-    # =========================================================
     def process_streaming(
         self,
         input_video_path,
@@ -79,12 +77,7 @@ class CarDetection:
         read_from_stub=False,
         stub_path=None,
     ):
-        """
-        المعالجة الستريمينج الكاملة: 3 threads بتشتغل بالتوازي الحقيقي (overlap):
-          Main Thread     (Producer) : قراءة الفريم + tracking تسلسلي فقط، ما بستنى نتيجة.
-          AnalysisConsumer            : OCR Gate + ThreadPoolExecutor (color/type/mmr) + رسم + لوج.
-          ResultWriter                : كتابة الفريم المرسوم للفيديو + تجميع النتائج.
-        """
+       
         if read_from_stub and stub_path is not None and os.path.exists(stub_path):
             with open(stub_path, "rb") as f:
                 cached = pickle.load(f)
@@ -103,8 +96,7 @@ class CarDetection:
         writer = cv.VideoWriter(output_video_path, fourcc, fps, (w, h))
 
         all_car_detections = []
-        # الـ writer + all_car_detections بيتسلموا لـ start() عشان الـ Writer Thread
-        # يستهلكهم لحاله، بدون ما الـ Main Thread يلمسهم بعد هيك.
+        
         self.start(writer=writer, all_car_detections=all_car_detections)
 
         frame_idx = 0
@@ -116,7 +108,6 @@ class CarDetection:
                 if not ret:
                     break
 
-                # ── PRODUCER: Tracking تسلسلي فقط (إجباري بسبب persist=True) ──
                 with self._timed("tracking"):
                     results = self.model.track(
                         frame,
@@ -128,11 +119,9 @@ class CarDetection:
 
                     car_metadata = self._extract_metadata(frame, results)
 
-                    # نسخ الـ crops لتفادي مشاكل الـ memory views
                     for tid in car_metadata:
                         car_metadata[tid]["crop"] = car_metadata[tid]["crop"].copy()
 
-                # ── put فقط، بدون أي get بعده — هون بالضبط منكسب الـ overlap الحقيقي ──
                 self._analysis_queue.put(
                     (frame.copy(), frame_idx, car_metadata, (w, h))
                 )
@@ -141,9 +130,7 @@ class CarDetection:
 
         finally:
             cap.release()
-            # poison pill لـ analysis_queue: الـ consumer بيفضّي الباقي المتراكم أولاً
-            # وبعدين يمرر poison pill لـ result_queue بنفسه، فالـ writer بياخد كل شي
-            # قبل ما يقفل ويسوي writer.release() لحاله. ولا فريم بينضاع.
+           
             self.stop()
 
         if stub_path is not None:
@@ -160,23 +147,15 @@ class CarDetection:
         )
         self.print_performance_report()
 
-    # =========================================================
     # LIFECYCLE: Start / Stop (Clean Shutdown)
-    # =========================================================
     def start(self, writer=None, all_car_detections=None):
-        """
-        تشغيل الـ Consumer Thread + الـ Writer Thread.
-        writer/all_car_detections اختياريين — لو ما انعطوا، بتضل قادر تسحب
-        من self._result_queue يدويًا بدل ما يكون في Writer يفضّيها أوتوماتيك.
-        """
+       
         self._stop_event.clear()
 
         self._worker_thread = threading.Thread(
             target=self._consumer_loop,
             name="AnalysisConsumer",
-            # daemon=True: شبكة أمان — لو الـ main thread طاح/خرج بشكل غير طبيعي
-            # قبل ما ينادي stop()، هاد الـ thread ما بيمنع خروج البروسيس ويصير "معلّق حي".
-            # الإغلاق النظيف (بدون فقدان فريمات) لسا مضمون عبر drain في stop().
+           
             daemon=True,
         )
         self._worker_thread.start()
@@ -192,33 +171,23 @@ class CarDetection:
             self._writer_thread.start()
 
     def stop(self, timeout=30.0):
-        """
-        إيقاف مرتّب وآمن (drain-then-stop، مش stop-then-drop):
-        1. poison pill بـ put() الحاجزة (مش put_nowait) — لازم توصل مهما استنّت،
-           عشان ما تنضاع الإشارة لو الطابور مليان.
-        2. الـ consumer بيفضّي كل الفريمات المتراكمة قبل ما ياخد الـ poison pill،
-           وبعدين هو نفسه بيمرر poison pill لـ result_queue.
-        3. ننتظر الـ Writer يخلص يكتب كل شي متراكم ويقفل الفيديو.
-        4. نقفل الـ ThreadPoolExecutor.
-        النتيجة: ولا فريم بينضاع، وولا thread بيضل حي بعد الرجوع من stop().
-        """
-        self._analysis_queue.put(None)  # poison pill — بلوكينج، لازم توصل
+       
+        self._analysis_queue.put(None)  
 
         if self._worker_thread is not None:
             self._worker_thread.join(timeout=timeout)
             if self._worker_thread.is_alive():
                 print(
-                    "[WARN] AnalysisConsumer لسا شغال بعد "
-                    f"{timeout}s — فيه bottleneck أو تعليقة بمكوّن من المكونات."
+                    f"{timeout}s — Bottleneck or hang detected in one of the components"
                 )
 
         if self._writer_thread is not None:
             self._writer_thread.join(timeout=timeout)
             if self._writer_thread.is_alive():
-                print(f"[WARN] ResultWriter لسا شغال بعد {timeout}s — تحقق من كتابة الفيديو.")
+                print(f"[WARN] ResultWriter is still running after {timeout}s — check video writing")
 
         self._executor.shutdown(wait=True, cancel_futures=True)
-        self._stop_event.set()  # علم حالة "مقفول" — ما بيتحكم بأي loop، بس للاستعلام
+        self._stop_event.set()  
 
     def is_running(self):
         return not self._stop_event.is_set()
@@ -227,23 +196,13 @@ class CarDetection:
         try:
             self.stop()
         except Exception:
-            pass  # ما بدنا استثناء بـ __del__ يطيح البروسيس وقت التنظيف
+            pass  
 
-    # =========================================================
     # CONSUMER LOOP (Single Worker)
-    # =========================================================
     def _consumer_loop(self):
-        """
-        مستهلك وحيد (FIFO). بيضل شغال بـ blocking get() لحد ما ياخد poison pill
-        (None) بالذات — مش لحد ما ينحط stop_event. هيك أي فريمات متراكمة بالطابور
-        وقت نداء stop() بتتفضّى بالكامل قبل ما الـ thread يخلص (drain-then-stop).
-
-        1. OCR Logic Gate (Plate Detection + OCR)
-        2. Filtered Batch → ThreadPoolExecutor (Color / Type / MMR)
-        3. Collect → Draw → Log → إرسال لـ Writer Thread
-        """
+        
         while True:
-            item = self._analysis_queue.get()  # blocking — بدون polling/timeout
+            item = self._analysis_queue.get()  
 
             if item is None:  # poison pill من stop()
                 break
@@ -253,13 +212,11 @@ class CarDetection:
             frame_t0 = time.perf_counter()
 
             try:
-                # ── المرحلة 1: OCR Logic Gate (تسلسلي، قبل أي تفريع) ──
                 with self._timed("ocr_gate"):
                     plates_data, filtered_metadata = self._apply_ocr_gate(
                         frame, car_metadata, frame_idx, frame_size
                     )
 
-                # ── المرحلة 2: Parallel Analysis على الـ Filtered Batch فقط ──
                 with self._timed("parallel_stage_wall"):
                     if filtered_metadata:
                         colors, types, mmrs = self._run_parallel_analysis(
@@ -268,43 +225,32 @@ class CarDetection:
                     else:
                         colors, types, mmrs = {}, {}, {}
 
-                # ── المرحلة 3: بناء النتائج النهائية ──
                 car_list = self._build_final_results(
                     car_metadata, filtered_metadata, plates_data, colors, types, mmrs
                 )
 
-                # ── المرحلة 4: الرسم والتسجيل ──
                 with self._timed("draw"):
                     self.draw_frame(frame, car_list)
                 with self._timed("log"):
                     for car in car_list:
                         self._log_from_dict(frame_idx, car)
 
-                # ── المرحلة 5: إرسال للـ Writer Thread (بدون انتظار منه) ──
                 self._result_queue.put((frame_idx, frame, car_list))
                 self._sample_queue_depth()
 
-                # ── المرحلة 6: تنظيف المسارات الميتة ──
                 self._cleanup_detectors(frame_idx)
 
                 with self._stats_lock:
                     self._stats["frame_total"].append(time.perf_counter() - frame_t0)
 
             except Exception as exc:
-                # فريم وحد فاشل ما لازم يطيح الـ Consumer كامل (يعني ما رح يعلّق
-                # الـ Producer على طابور مليان للأبد لو صار خطأ غير متوقع بمكوّن).
+               
                 print(f"[ERROR] Consumer failed on frame {frame_idx}: {exc!r}")
 
-        # خلصنا نفضّي analysis_queue بالكامل → مرر poison pill لـ result_queue
         self._result_queue.put(None)
 
     def _writer_loop(self, writer, all_car_detections):
-        """
-        Consumer ثاني بيسحب من result_queue بالترتيب (FIFO) ويكتب الفيديو —
-        بدون ما يخلي الـ Producer (main thread) ينتظره. هون بالضبط منكسب الـ
-        overlap الحقيقي: بينما هاد الـ thread عم يكتب فريم N-1، الـ Consumer عم
-        يحلل فريم N، والـ Producer عم يتتبع فريم N+1 — الثلاثة بنفس اللحظة.
-        """
+       
         while True:
             item = self._result_queue.get()
             if item is None:  # poison pill من الـ consumer
@@ -318,20 +264,12 @@ class CarDetection:
 
         writer.release()
 
-    # =========================================================
     # OCR LOGIC GATE (Single Responsibility)
-    # =========================================================
     def _apply_ocr_gate(self, frame, car_metadata, frame_idx, frame_size):
-        """
-        تشغيل Plate Detection & OCR لكل السيارات في الفريم.
-        ترجع:
-            plates_data: {track_id: plate_bbox}
-            filtered_metadata: السيارات التي اجتازت شرط OCR فقط.
-        """
+        
         if self.plate_detector is None or not car_metadata:
             return {}, {}
 
-        # Thread-safety: lock حول OCR reader إذا لزم (defensive)
         with self._ocr_lock:
             plates_data = self.plate_detector.track_plates_for_frame(
                 frame, car_metadata, frame_idx, frame_size
@@ -346,20 +284,14 @@ class CarDetection:
             pt = self.plate_detector.plate_tracks.get(plate_track_id, {})
             text = pt.get("text")
 
-            # شرط الـ Gate: يجب أن يكون النص صالحاً (ليس None ولا فارغ)
             if text and str(text).strip():
                 filtered_metadata[track_id] = meta
 
         return plates_data, filtered_metadata
 
-    # =========================================================
     # PARALLEL ANALYSIS (ThreadPoolExecutor)
-    # =========================================================
     def _run_parallel_analysis(self, frame, filtered_metadata, frame_idx):
-        """
-        تشغيل Color + Type + MMR بالتوازي عبر ThreadPoolExecutor.
-        الـ Consumer ينتظر حتى تكتمل الثلاثة.
-        """
+       
         car_crops = {
             tid: filtered_metadata[tid]["bbox"] for tid in filtered_metadata
         }
@@ -406,16 +338,12 @@ class CarDetection:
 
         return colors, types, mmrs
 
-    # =========================================================
+
     # RESULT BUILDER
-    # =========================================================
     def _build_final_results(
         self, car_metadata, filtered_metadata, plates_data, colors, types, mmrs
     ):
-        """
-        تجميع قائمة النتائج النهائية.
-        السيارات المرفوضة (بدون OCR) تُدرج ببيانات YOLO فقط.
-        """
+        
         car_list = []
         for track_id, meta in car_metadata.items():
             passed_gate = track_id in filtered_metadata
@@ -468,11 +396,8 @@ class CarDetection:
             )
         return car_list
 
-    # =========================================================
     # PRODUCER HELPERS
-    # =========================================================
     def _extract_metadata(self, frame, results):
-        """استخراج بيانات السيارات من نتيجة YOLO track."""
         id_name_dict = results.names
         car_metadata = {}
         for box in results.boxes:
@@ -500,16 +425,12 @@ class CarDetection:
         return car_metadata
 
     def _playback_cached(self, output_video_path, cached_detections):
-        """إعادة رسم من stub مخزن (بدون إعادة كشف)."""
-        # يمكن تنفيذها لاحقاً حسب الحاجة
+       
         pass
 
-    # =========================================================
     # PROFILING / INSTRUMENTATION
-    # =========================================================
     @contextmanager
     def _timed(self, stage_name):
-        """قياس زمن أي مرحلة + اسم الـ thread يلي نفذتها فعليًا."""
         t0 = time.perf_counter()
         yield
         dt = time.perf_counter() - t0
@@ -518,11 +439,7 @@ class CarDetection:
             self._thread_names[stage_name].add(threading.current_thread().name)
 
     def _timed_call(self, stage_name, func, *args, **kwargs):
-        """
-        نفس فكرة _timed بس كدالة قابلة للتمرير لـ executor.submit مباشرة —
-        لازم القياس ياخذ مكان جوا thread الـ pool نفسه، مو جوا thread الاستدعاء،
-        وإلا رح نقيس زمن التسليم مش زمن التنفيذ الفعلي، ولا رح نعرف مين نفذ شو.
-        """
+        
         t0 = time.perf_counter()
         result = func(*args, **kwargs)
         dt = time.perf_counter() - t0
@@ -532,30 +449,16 @@ class CarDetection:
         return result
 
     def _sample_queue_depth(self):
-        """
-        أهم مؤشر على إذا في overlap حقيقي أو لأ: لو الطابورين قريبين من صفر
-        دايمًا، معناتها ما في backlog وما في pipelining فعلي (رجعنا لنفس مشكلة
-        الـ synchronous rendezvous القديمة). لو في تذبذب حقيقي بالعمق، هاد دليل
-        إنه الـ 3 threads (Producer/Consumer/Writer) شغالين بالتوازي فعليًا.
-        """
+        
         with self._stats_lock:
             self._queue_depth_samples["analysis_queue"].append(self._analysis_queue.qsize())
             self._queue_depth_samples["result_queue"].append(self._result_queue.qsize())
 
     def report_active_threads(self):
-        """قائمة كل الـ threads الحية حاليًا بالبروسيس — للتأكد ما في dead/leaked threads."""
         return [t.name for t in threading.enumerate()]
 
     def get_performance_report(self):
-        """
-        ملخص أداء كل مرحلة: عدد المرات، متوسط/أدنى/أعلى زمن، FPS مكافئ، وأسماء
-        الـ threads يلي فعليًا نفذت هالمرحلة. بالإضافة لـ parallel_efficiency_ratio:
-        (متوسط زمن color + متوسط زمن type + متوسط زمن mmr) / متوسط زمن parallel_stage_wall
-          - قريب من 3  → تسريع حقيقي ممتاز (المكونات فعلاً بتشتغل بالتوازي).
-          - قريب من 1  → ولا تسريع، تنفيذ متسلسل فعليًا رغم استخدام threads
-            (الاحتمال الأكبر: GIL contention لأنه المكونات Python-bound وما
-            بتحرر الـ GIL كفاية أثناء التنفيذ).
-        """
+       
         with self._stats_lock:
             report = {}
             for stage, durations in self._stats.items():
@@ -617,9 +520,7 @@ class CarDetection:
         print(f"Active threads now: {report['active_threads_now']}")
         print("=" * 70 + "\n")
 
-    # =========================================================
     # CLEANUP
-    # =========================================================
     def _cleanup_detectors(self, frame_idx):
         if self.type_classifier is not None:
             self.type_classifier.cleanup_inactive_tracks(frame_idx)
@@ -628,9 +529,7 @@ class CarDetection:
         if self.make_model_detector is not None:
             self.make_model_detector.cleanup_inactive_tracks(frame_idx)
 
-    # =========================================================
     # CROP & CLIP (DRY)
-    # =========================================================
     def _crop(self, frame, bbox):
         x1, y1, x2, y2 = [int(v) for v in bbox]
         h, w, _ = frame.shape
@@ -647,9 +546,7 @@ class CarDetection:
         x2, y2 = min(w, x2), min(h, y2)
         return x1, y1, x2, y2
 
-    # =========================================================
     # LOGGING
-    # =========================================================
     def _log_from_dict(self, frame_idx, detection):
         self._log_prediction(
             track_id=detection["track_id"],
@@ -666,6 +563,7 @@ class CarDetection:
             plate_track_id=detection.get("plate_track_id"),
             plate_text=detection.get("plate_text"),
             plate_text_conf=detection.get("plate_text_conf"),
+             bbox=detection.get("bbox"),
         )
 
     def _log_prediction(
@@ -684,6 +582,7 @@ class CarDetection:
         plate_track_id=None,
         plate_text=None,
         plate_text_conf=None,
+        bbox=None,
     ):
         with self._log_lock:
             if track_id not in self.tracking_log:
@@ -692,6 +591,7 @@ class CarDetection:
             self.tracking_log[track_id].append(
                 {
                     "frame": frame_idx,
+                    "bbox": bbox,
                     "yolo_class": yolo_class,
                     "yolo_confidence": round(yolo_conf, 3) if yolo_conf is not None else 0.0,
                     "predicted_type": smoothed_type,
@@ -720,26 +620,9 @@ class CarDetection:
 
 
     
-    # =========================================================
-    # FINALIZE & EXPORT (Post-Processing — بعد انتهاء الفيديو)
-    # =========================================================
+    # FINALIZE & EXPORT 
     def finalize_tracking_log(self, per_field_best=True):
-        """
-        يبني تقرير نهائي (JSON-ready) من الـ tracking_log الخام.
-
-        Logic:
-          1. فلترة OCR: استبعد أي track_id ما عنده ولا frame فيه plate_text صالح.
-          2. لكل سيارة متبقية:
-             - لو per_field_best=True:  كل حقل (plate/type/color/mmr) بيجي من الإطار
-               يلي فيه أعلى confidence لهاد الحقل بالتحديد.
-             - لو per_field_best=False: بيختار إطار واحد (الأعلى بـ plate_conf)
-               وبيسحب كل الحقول منو.
-          3. بيرجع dict جاهز للـ JSON / Backend.
-
-        ملاحظة: هاي الدالة بتشتغل على الذاكرة فقط (O(n))، وبتستدعى بعد
-        stop() لما كل الـ threads تكون ميتة — فما في حاجة لـ locks إضافية.
-        """
-        # ناخد snapshot من الـ log (defensive — لو اتصلت قبل ما يقفل)
+        
         with self._log_lock:
             raw_log = {
                 tid: list(entries) for tid, entries in self.tracking_log.items()
@@ -751,16 +634,14 @@ class CarDetection:
             if not frames:
                 continue
 
-            # ── 1. فلترة OCR: لازم يكون فيه frame واحد على الأقل فيه plate_text ──
             valid_frames = [
                 f for f in frames
                 if f.get("plate_text") and str(f["plate_text"]).strip()
             ]
             if not valid_frames:
-                continue  # ← استبعد السيارة بالكامل
+                continue  
 
             if per_field_best:
-                # ── 2a. Per-field best: كل حقل من أفضل إطار له ──
                 best_plate = max(
                     valid_frames,
                     key=lambda f: f.get("plate_text_conf") or 0.0
@@ -794,7 +675,6 @@ class CarDetection:
                     "valid_frames_with_ocr": len(valid_frames),
                 }
             else:
-                # ── 2b. Single best frame: أعلى plate_conf، كل الحقول منو ──
                 best = max(
                     valid_frames,
                     key=lambda f: f.get("plate_text_conf") or 0.0
@@ -821,18 +701,14 @@ class CarDetection:
         return final_report
 
     def save_final_report(self, output_path="final_report.json", per_field_best=True):
-        """
-        يبني التقرير النهائي ويحفظو كـ JSON.
-        """
+       
         report = self.finalize_tracking_log(per_field_best=per_field_best)
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(report, f, ensure_ascii=False, indent=2)
         print(f"[FINALIZE] Saved {len(report)} vehicles to: {output_path}")
         return report
 
-    # =========================================================
     # DRAWING (unchanged logic, isolated)
-    # =========================================================
     @staticmethod
     def _draw_label(frame, text, x, y, bg_color, font_scale=0.45, thickness=1):
         (text_w, text_h), _ = cv.getTextSize(
@@ -935,9 +811,7 @@ class CarDetection:
             output_frames.append(frame)
         return output_frames
 
-    # =========================================================
-    # LEGACY BATCH API (محفوظ للتوافق)
-    # =========================================================
+    # LEGACY BATCH API 
     def detect_frames(self, frames, read_from_stub=False, stub_path=None):
         if read_from_stub and stub_path is not None:
             with open(stub_path, "rb") as f:
@@ -953,10 +827,7 @@ class CarDetection:
         return car_detections
 
     def detect_frame(self, frame, frame_idx):
-        """
-        النسخة القديمة (batch per frame) — محفوظة للتوافق.
-        يُفضل استخدام process_streaming() للأداء.
-        """
+        
         frame_height, frame_width = frame.shape[:2]
         results = self.model.track(
             frame, persist=True, iou=0.1, conf=self.confidence_threshold, verbose=False
