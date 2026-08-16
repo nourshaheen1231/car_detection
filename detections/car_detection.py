@@ -104,11 +104,18 @@ class CarDetection:
 
         try:
             while True:
-                ret, frame = cap.read()
+                # ═══════════════════════════════════════════════════════
+                # 1. READ PHASE (I/O) — منفصل تماماً عن الـ AI
+                # ═══════════════════════════════════════════════════════
+                with self._timed("read_frame"):
+                    ret, frame = cap.read()
                 if not ret:
                     break
 
-                with self._timed("tracking"):
+                # ═══════════════════════════════════════════════════════
+                # 2. TRACKING PHASE — مفصّل لـ 3 أجزاء
+                # ═══════════════════════════════════════════════════════
+                with self._timed("tracking_inference"):
                     results = self.model.track(
                         frame,
                         persist=True,
@@ -117,8 +124,10 @@ class CarDetection:
                         verbose=False,
                     )[0]
 
+                with self._timed("tracking_extract_metadata"):
                     car_metadata = self._extract_metadata(frame, results)
 
+                with self._timed("tracking_crop_copy"):
                     for tid in car_metadata:
                         car_metadata[tid]["crop"] = car_metadata[tid]["crop"].copy()
 
@@ -130,7 +139,6 @@ class CarDetection:
 
         finally:
             cap.release()
-           
             self.stop()
 
         if stub_path is not None:
@@ -149,13 +157,11 @@ class CarDetection:
 
     # LIFECYCLE: Start / Stop (Clean Shutdown)
     def start(self, writer=None, all_car_detections=None):
-       
         self._stop_event.clear()
 
         self._worker_thread = threading.Thread(
             target=self._consumer_loop,
             name="AnalysisConsumer",
-           
             daemon=True,
         )
         self._worker_thread.start()
@@ -171,20 +177,19 @@ class CarDetection:
             self._writer_thread.start()
 
     def stop(self, timeout=30.0):
-       
         self._analysis_queue.put(None)  
 
         if self._worker_thread is not None:
             self._worker_thread.join(timeout=timeout)
             if self._worker_thread.is_alive():
                 print(
-                    f"{timeout}s — Bottleneck or hang detected in one of the components"
+                    f"[WARN] AnalysisConsumer still running after {timeout}s — Bottleneck or hang detected"
                 )
 
         if self._writer_thread is not None:
             self._writer_thread.join(timeout=timeout)
             if self._writer_thread.is_alive():
-                print(f"[WARN] ResultWriter is still running after {timeout}s — check video writing")
+                print(f"[WARN] ResultWriter still running after {timeout}s — check video writing")
 
         self._executor.shutdown(wait=True, cancel_futures=True)
         self._stop_event.set()  
@@ -200,7 +205,6 @@ class CarDetection:
 
     # CONSUMER LOOP (Single Worker)
     def _consumer_loop(self):
-        
         while True:
             item = self._analysis_queue.get()  
 
@@ -209,14 +213,23 @@ class CarDetection:
 
             self._sample_queue_depth()
             frame, frame_idx, car_metadata, frame_size = item
-            frame_t0 = time.perf_counter()
+            
+            # ═══════════════════════════════════════════════════════
+            # بداية قياس الـ AI Pipeline الكامل (بدون I/O)
+            # ═══════════════════════════════════════════════════════
+            ai_t0 = time.perf_counter()
 
             try:
-                with self._timed("ocr_gate"):
-                    plates_data, filtered_metadata = self._apply_ocr_gate(
-                        frame, car_metadata, frame_idx, frame_size
-                    )
+                # ═══════════════════════════════════════════════════════
+                # 3. OCR GATE — مفصّل لـ جزئين
+                # ═══════════════════════════════════════════════════════
+                plates_data, filtered_metadata = self._apply_ocr_gate(
+                    frame, car_metadata, frame_idx, frame_size
+                )
 
+                # ═══════════════════════════════════════════════════════
+                # 4. PARALLEL ANALYSIS (color / type / mmr)
+                # ═══════════════════════════════════════════════════════
                 with self._timed("parallel_stage_wall"):
                     if filtered_metadata:
                         colors, types, mmrs = self._run_parallel_analysis(
@@ -225,13 +238,21 @@ class CarDetection:
                     else:
                         colors, types, mmrs = {}, {}, {}
 
-                car_list = self._build_final_results(
-                    car_metadata, filtered_metadata, plates_data, colors, types, mmrs
-                )
+                # ═══════════════════════════════════════════════════════
+                # 5. BUILD RESULTS
+                # ═══════════════════════════════════════════════════════
+                with self._timed("build_results"):
+                    car_list = self._build_final_results(
+                        car_metadata, filtered_metadata, plates_data, colors, types, mmrs
+                    )
 
-                with self._timed("draw"):
+                # ═══════════════════════════════════════════════════════
+                # 6. DRAW & LOG
+                # ═══════════════════════════════════════════════════════
+                with self._timed("draw_frame"):
                     self.draw_frame(frame, car_list)
-                with self._timed("log"):
+                
+                with self._timed("log_prediction"):
                     for car in car_list:
                         self._log_from_dict(frame_idx, car)
 
@@ -240,58 +261,66 @@ class CarDetection:
 
                 self._cleanup_detectors(frame_idx)
 
+                # ═══════════════════════════════════════════════════════
+                # نهاية قياس الـ AI Pipeline الكامل
+                # ═══════════════════════════════════════════════════════
                 with self._stats_lock:
-                    self._stats["frame_total"].append(time.perf_counter() - frame_t0)
+                    self._stats["ai_pipeline_total"].append(time.perf_counter() - ai_t0)
 
             except Exception as exc:
-               
                 print(f"[ERROR] Consumer failed on frame {frame_idx}: {exc!r}")
 
         self._result_queue.put(None)
 
     def _writer_loop(self, writer, all_car_detections):
-       
         while True:
             item = self._result_queue.get()
             if item is None:  # poison pill من الـ consumer
                 break
 
             frame_idx, drawn_frame, car_list = item
-            with self._timed("write"):
+            
+            # ═══════════════════════════════════════════════════════
+            # 7. WRITE PHASE (I/O) — منفصل تماماً
+            # ═══════════════════════════════════════════════════════
+            with self._timed("write_frame"):
                 writer.write(drawn_frame)
+            
             if all_car_detections is not None:
                 all_car_detections.append(car_list)
 
         writer.release()
 
-    # OCR LOGIC GATE (Single Responsibility)
+    # OCR LOGIC GATE — مفصّل لـ جزئين
     def _apply_ocr_gate(self, frame, car_metadata, frame_idx, frame_size):
-        
         if self.plate_detector is None or not car_metadata:
             return {}, {}
 
         with self._ocr_lock:
-            plates_data = self.plate_detector.track_plates_for_frame(
-                frame, car_metadata, frame_idx, frame_size
-            )
+            # الجزء 1: اكتشاف اللوحات (النموذج نفسه)
+            with self._timed("ocr_plate_detection"):
+                plates_data = self.plate_detector.track_plates_for_frame(
+                    frame, car_metadata, frame_idx, frame_size
+                )
 
-        filtered_metadata = {}
-        for track_id, meta in car_metadata.items():
-            plate_track_id = self.plate_detector.car_to_plate.get(track_id)
-            if plate_track_id is None:
-                continue
+            # الجزء 2: فلترة المركبات بناءً على نص اللوحة
+            with self._timed("ocr_filter_metadata"):
+                filtered_metadata = {}
+                for track_id, meta in car_metadata.items():
+                    plate_track_id = self.plate_detector.car_to_plate.get(track_id)
+                    if plate_track_id is None:
+                        continue
 
-            pt = self.plate_detector.plate_tracks.get(plate_track_id, {})
-            text = pt.get("text")
+                    pt = self.plate_detector.plate_tracks.get(plate_track_id, {})
+                    text = pt.get("text")
 
-            if text and str(text).strip():
-                filtered_metadata[track_id] = meta
+                    if text and str(text).strip():
+                        filtered_metadata[track_id] = meta
 
         return plates_data, filtered_metadata
 
     # PARALLEL ANALYSIS (ThreadPoolExecutor)
     def _run_parallel_analysis(self, frame, filtered_metadata, frame_idx):
-       
         car_crops = {
             tid: filtered_metadata[tid]["bbox"] for tid in filtered_metadata
         }
@@ -343,7 +372,6 @@ class CarDetection:
     def _build_final_results(
         self, car_metadata, filtered_metadata, plates_data, colors, types, mmrs
     ):
-        
         car_list = []
         for track_id, meta in car_metadata.items():
             passed_gate = track_id in filtered_metadata
@@ -425,7 +453,6 @@ class CarDetection:
         return car_metadata
 
     def _playback_cached(self, output_video_path, cached_detections):
-       
         pass
 
     # PROFILING / INSTRUMENTATION
@@ -439,7 +466,6 @@ class CarDetection:
             self._thread_names[stage_name].add(threading.current_thread().name)
 
     def _timed_call(self, stage_name, func, *args, **kwargs):
-        
         t0 = time.perf_counter()
         result = func(*args, **kwargs)
         dt = time.perf_counter() - t0
@@ -449,7 +475,6 @@ class CarDetection:
         return result
 
     def _sample_queue_depth(self):
-        
         with self._stats_lock:
             self._queue_depth_samples["analysis_queue"].append(self._analysis_queue.qsize())
             self._queue_depth_samples["result_queue"].append(self._result_queue.qsize())
@@ -458,7 +483,6 @@ class CarDetection:
         return [t.name for t in threading.enumerate()]
 
     def get_performance_report(self):
-       
         with self._stats_lock:
             report = {}
             for stage, durations in self._stats.items():
@@ -471,6 +495,7 @@ class CarDetection:
                     "avg_ms": round(total / n * 1000, 2),
                     "min_ms": round(min(durations) * 1000, 2),
                     "max_ms": round(max(durations) * 1000, 2),
+                    "total_s": round(total, 2),
                     "equivalent_fps": round(n / total, 2) if total > 0 else None,
                     "threads_used": sorted(self._thread_names.get(stage, [])),
                 }
@@ -483,6 +508,7 @@ class CarDetection:
                 for name, samples in self._queue_depth_samples.items()
             }
 
+        # حساب الكفاءة المتوازية
         parallel_efficiency = None
         component_stages = [s for s in ("color", "type", "mmr") if s in report]
         if component_stages and "parallel_stage_wall" in report:
@@ -491,34 +517,133 @@ class CarDetection:
             if wall_avg > 0:
                 parallel_efficiency = round(sum_components_avg / wall_avg, 2)
 
+        # تجميعات I/O مقابل AI
+        io_stages = ["read_frame", "write_frame"]
+        ai_stages = [s for s in report if s not in io_stages and s not in ("frame_total",)]
+        
+        io_total_time = sum(report[s]["total_s"] for s in io_stages if s in report)
+        ai_total_time = report.get("ai_pipeline_total", {}).get("total_s", 0)
+        total_frames = report.get("ai_pipeline_total", {}).get("count", 0)
+
         return {
             "stages": report,
             "queue_depth_avg_max": depths,
             "parallel_efficiency_ratio": parallel_efficiency,
             "active_threads_now": self.report_active_threads(),
+            "summary": {
+                "total_frames": total_frames,
+                "io_total_time_s": round(io_total_time, 2),
+                "ai_total_time_s": round(ai_total_time, 2),
+                "avg_io_per_frame_ms": round(io_total_time / total_frames * 1000, 2) if total_frames else 0,
+                "avg_ai_per_frame_ms": round(ai_total_time / total_frames * 1000, 2) if total_frames else 0,
+                "overall_fps_if_sequential": round(total_frames / (io_total_time + ai_total_time), 2) if (io_total_time + ai_total_time) > 0 else 0,
+            }
         }
 
     def print_performance_report(self):
         report = self.get_performance_report()
-        print("\n" + "=" * 70)
+        stages = report["stages"]
+        summary = report["summary"]
+
+        print("\n" + "=" * 80)
         print("PERFORMANCE REPORT")
-        print("=" * 70)
-        for stage, s in report["stages"].items():
+        print("=" * 80)
+
+        # ─── I/O OPERATIONS ───
+        print("\n>>> I/O OPERATIONS (Read / Write) <<<")
+        io_names = ["read_frame", "write_frame"]
+        for name in io_names:
+            if name in stages:
+                s = stages[name]
+                print(
+                    f"{name:25s} | n={s['count']:5d} | avg={s['avg_ms']:7.2f}ms | "
+                    f"min={s['min_ms']:7.2f}ms | max={s['max_ms']:7.2f}ms | "
+                    f"total={s['total_s']:6.1f}s"
+                )
+
+        # ─── AI PIPELINE — TRACKING ───
+        print("\n>>> AI PIPELINE — TRACKING <<<")
+        tracking_names = ["tracking_inference", "tracking_extract_metadata", "tracking_crop_copy"]
+        for name in tracking_names:
+            if name in stages:
+                s = stages[name]
+                print(
+                    f"{name:25s} | n={s['count']:5d} | avg={s['avg_ms']:7.2f}ms | "
+                    f"min={s['min_ms']:7.2f}ms | max={s['max_ms']:7.2f}ms | "
+                    f"~{s['equivalent_fps']:6.1f} fps | threads={s['threads_used']}"
+                )
+
+        # ─── AI PIPELINE — OCR GATE ───
+        print("\n>>> AI PIPELINE — OCR GATE <<<")
+        ocr_names = ["ocr_plate_detection", "ocr_filter_metadata"]
+        for name in ocr_names:
+            if name in stages:
+                s = stages[name]
+                print(
+                    f"{name:25s} | n={s['count']:5d} | avg={s['avg_ms']:7.2f}ms | "
+                    f"min={s['min_ms']:7.2f}ms | max={s['max_ms']:7.2f}ms | "
+                    f"~{s['equivalent_fps']:6.1f} fps | threads={s['threads_used']}"
+                )
+
+        # ─── AI PIPELINE — PARALLEL ANALYSIS ───
+        print("\n>>> AI PIPELINE — PARALLEL ANALYSIS <<<")
+        parallel_names = ["parallel_stage_wall", "color", "type", "mmr"]
+        for name in parallel_names:
+            if name in stages:
+                s = stages[name]
+                print(
+                    f"{name:25s} | n={s['count']:5d} | avg={s['avg_ms']:7.2f}ms | "
+                    f"min={s['min_ms']:7.2f}ms | max={s['max_ms']:7.2f}ms | "
+                    f"~{s['equivalent_fps']:6.1f} fps | threads={s['threads_used']}"
+                )
+
+        # ─── AI PIPELINE — POST-PROCESSING ───
+        print("\n>>> AI PIPELINE — POST-PROCESSING <<<")
+        post_names = ["build_results", "draw_frame", "log_prediction"]
+        for name in post_names:
+            if name in stages:
+                s = stages[name]
+                print(
+                    f"{name:25s} | n={s['count']:5d} | avg={s['avg_ms']:7.2f}ms | "
+                    f"min={s['min_ms']:7.2f}ms | max={s['max_ms']:7.2f}ms | "
+                    f"~{s['equivalent_fps']:6.1f} fps | threads={s['threads_used']}"
+                )
+
+        # ─── AI PIPELINE — TOTAL ───
+        if "ai_pipeline_total" in stages:
+            s = stages["ai_pipeline_total"]
+            print("\n>>> AI PIPELINE — TOTAL (Per Frame in Consumer) <<<")
             print(
-                f"{stage:20s} | n={s['count']:5d} | avg={s['avg_ms']:7.2f}ms | "
+                f"{'ai_pipeline_total':25s} | n={s['count']:5d} | avg={s['avg_ms']:7.2f}ms | "
                 f"min={s['min_ms']:7.2f}ms | max={s['max_ms']:7.2f}ms | "
                 f"~{s['equivalent_fps']:6.1f} fps | threads={s['threads_used']}"
             )
-        print("-" * 70)
+
+        # ─── QUEUE DEPTHS ───
+        print("\n>>> QUEUE DEPTHS <<<")
         for q, (avg_depth, max_depth) in report["queue_depth_avg_max"].items():
-            print(f"{q:20s} | avg_depth={avg_depth} | max_depth={max_depth}")
+            print(f"{q:25s} | avg_depth={avg_depth:5.1f} | max_depth={max_depth:3d}")
+
+        # ─── PARALLEL EFFICIENCY ───
         if report["parallel_efficiency_ratio"] is not None:
-            print("-" * 70)
-            print( "Parallel efficiency (sum(color + type + mmr) / parallel_wall) = " \
-            "" f"{report['parallel_efficiency_ratio']} " "(close to 3 = excellent real speedup | close to 1 = no speedup, likely GIL bottleneck)" )
-        print("-" * 70)
-        print(f"Active threads now: {report['active_threads_now']}")
-        print("=" * 70 + "\n")
+            print("\n>>> PARALLEL EFFICIENCY <<<")
+            print(
+                f"Ratio (sum components / wall) = {report['parallel_efficiency_ratio']}x "
+                f"(3.0 = perfect | 1.0 = no speedup, GIL bottleneck)"
+            )
+
+        # ─── SUMMARY ───
+        print("\n" + "=" * 80)
+        print("SUMMARY")
+        print("=" * 80)
+        print(f"Total frames processed:     {summary['total_frames']}")
+        print(f"I/O total time:             {summary['io_total_time_s']}s")
+        print(f"AI Pipeline total time:     {summary['ai_total_time_s']}s")
+        print(f"Avg I/O per frame:          {summary['avg_io_per_frame_ms']}ms")
+        print(f"Avg AI Pipeline per frame:  {summary['avg_ai_per_frame_ms']}ms")
+        print(f"Estimated sequential FPS:   {summary['overall_fps_if_sequential']}")
+        print(f"Active threads now:         {report['active_threads_now']}")
+        print("=" * 80 + "\n")
 
     # CLEANUP
     def _cleanup_detectors(self, frame_idx):
@@ -563,7 +688,7 @@ class CarDetection:
             plate_track_id=detection.get("plate_track_id"),
             plate_text=detection.get("plate_text"),
             plate_text_conf=detection.get("plate_text_conf"),
-             bbox=detection.get("bbox"),
+            bbox=detection.get("bbox"),
         )
 
     def _log_prediction(
@@ -622,7 +747,6 @@ class CarDetection:
     
     # FINALIZE & EXPORT 
     def finalize_tracking_log(self, per_field_best=True):
-        
         with self._log_lock:
             raw_log = {
                 tid: list(entries) for tid, entries in self.tracking_log.items()
@@ -701,7 +825,6 @@ class CarDetection:
         return final_report
 
     def save_final_report(self, output_path="final_report.json", per_field_best=True):
-       
         report = self.finalize_tracking_log(per_field_best=per_field_best)
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(report, f, ensure_ascii=False, indent=2)
@@ -827,7 +950,6 @@ class CarDetection:
         return car_detections
 
     def detect_frame(self, frame, frame_idx):
-        
         frame_height, frame_width = frame.shape[:2]
         results = self.model.track(
             frame, persist=True, iou=0.1, conf=self.confidence_threshold, verbose=False
