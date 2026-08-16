@@ -15,7 +15,14 @@ def extract_best_vehicle_images(video_path: str, tracking_log: dict, video_id: i
         if not frames:
             continue
         
-        best_frame_data = max(frames, key=lambda f: f.get("yolo_confidence", 0.0))
+        best_frame_data = max(
+            frames,
+            key=lambda f: (
+                f.get("plate_text_conf") or 0.0,  
+                f.get("yolo_confidence", 0.0)      
+            )
+        )
+        
         frame_num = best_frame_data["frame"]
         bbox = best_frame_data.get("bbox")
         
@@ -44,5 +51,5 @@ def extract_best_vehicle_images(video_path: str, tracking_log: dict, video_id: i
         images[track_id] = f"vehicles/{video_id}/{filename}"
 
     cap.release()
-    print(f"[EXTRACTOR] Saved {len(images)} vehicle crops")
+    print(f"[EXTRACTOR] Saved {len(images)} vehicle crops (best OCR frame)")
     return images

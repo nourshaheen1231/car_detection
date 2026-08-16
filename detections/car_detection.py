@@ -8,6 +8,7 @@ import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from bridge.video_writer import FFmpegStreamWriter
 
 from ultralytics import YOLO
 
@@ -92,8 +93,7 @@ class CarDetection:
         w = int(cap.get(cv.CAP_PROP_FRAME_WIDTH))
         h = int(cap.get(cv.CAP_PROP_FRAME_HEIGHT))
 
-        fourcc = cv.VideoWriter_fourcc(*"mp4v")
-        writer = cv.VideoWriter(output_video_path, fourcc, fps, (w, h))
+        writer = FFmpegStreamWriter(output_video_path, fps, (w, h), use_gpu=False)
 
         all_car_detections = []
         
