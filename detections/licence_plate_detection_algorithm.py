@@ -12,7 +12,7 @@ class PlateDetector:
         self,
         max_lost_frames=5,
         plate_roi_ratio=0.45,
-        min_plate_confidence=0.3,
+        min_plate_confidence=0.5,
         enable_ocr=True,
         ocr_retry_interval=5,
         plate_padding=3,

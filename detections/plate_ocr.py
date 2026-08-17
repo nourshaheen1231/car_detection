@@ -46,48 +46,74 @@ def paddle_readtext(license_plate_crops):
     return detected_chars_per_crop
 
 
-def license_complies_format(text):
-    if len(text) != 7:
-        return False
-
-    return (
-        (text[0] in string.ascii_uppercase or text[0] in dict_int_to_char)
-        and (text[1] in string.ascii_uppercase or text[1] in dict_int_to_char)
-        and (text[2] in "0123456789" or text[2] in dict_char_to_int)
-        and (text[3] in "0123456789" or text[3] in dict_char_to_int)
-        and (text[4] in string.ascii_uppercase or text[4] in dict_int_to_char)
-        and (text[5] in string.ascii_uppercase or text[5] in dict_int_to_char)
-        and (text[6] in string.ascii_uppercase or text[6] in dict_int_to_char)
-    )
+# L = letter, D = digit. Applied after spaces/hyphens are stripped.
+# AB12 CDE → LLDDLLL
+# A12 CDE  → LDDLLL
+# A-123-CD → LDDDLL
+PLATE_PATTERNS = (
+    "LLDDLLL",
+    "LDDLLL",
+    "LDDDLL",
+)
 
 
-def format_license(text):
-    mapping = {
-        0: dict_int_to_char,
-        1: dict_int_to_char,
-        2: dict_char_to_int,
-        3: dict_char_to_int,
-        4: dict_int_to_char,
-        5: dict_int_to_char,
-        6: dict_int_to_char,
-    }
-    license_plate_ = ""
-    for j in range(7):
-        if text[j] in mapping[j]:
-            license_plate_ += mapping[j][text[j]]
+def _char_matches(ch, kind):
+    if kind == "L":
+        return ch in string.ascii_uppercase or ch in dict_int_to_char
+    return ch in "0123456789" or ch in dict_char_to_int
+
+
+def _pattern_score(text, pattern):
+    if len(text) != len(pattern):
+        return None
+    score = 0
+    for ch, kind in zip(text, pattern):
+        if not _char_matches(ch, kind):
+            return None
+        if kind == "L":
+            score += 2 if ch in string.ascii_uppercase else 1
         else:
-            license_plate_ += text[j]
-    return license_plate_
+            score += 2 if ch in "0123456789" else 1
+    return score
+
+
+def license_complies_format(text):
+    return any(_pattern_score(text, pattern) is not None for pattern in PLATE_PATTERNS)
+
+
+def format_license(text, pattern=None):
+    if pattern is None:
+        pattern = max(
+            (p for p in PLATE_PATTERNS if _pattern_score(text, p) is not None),
+            key=lambda p: _pattern_score(text, p),
+            default=None,
+        )
+    if pattern is None:
+        return text
+
+    mapped = []
+    for ch, kind in zip(text, pattern):
+        table = dict_int_to_char if kind == "L" else dict_char_to_int
+        mapped.append(table.get(ch, ch))
+    return "".join(mapped)
 
 
 def pick_license_plate(detected_chars):
 
     for text, score in detected_chars:
-        text = text.upper().replace(" ", "")
+        text = text.upper().replace(" ", "").replace("-", "")
 
-        if license_complies_format(text):
-            return format_license(text), score
-        
+        best_pattern = None
+        best_fit = -1
+        for pattern in PLATE_PATTERNS:
+            fit = _pattern_score(text, pattern)
+            if fit is not None and fit > best_fit:
+                best_pattern = pattern
+                best_fit = fit
+
+        if best_pattern is not None:
+            return format_license(text, best_pattern), score
+
     return None, None
 
 

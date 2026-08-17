@@ -11,7 +11,8 @@ class YoloPlateDetector(PlateDetector):
         self,
         model_path,
         max_lost_frames=5,
-        min_plate_confidence=0.3,
+        min_plate_confidence=0.5,
+        location_retry_interval=10,
         enable_ocr=True,
         ocr_retry_interval=5,
         plate_padding=3,
@@ -24,6 +25,8 @@ class YoloPlateDetector(PlateDetector):
             ocr_retry_interval=ocr_retry_interval,
             plate_padding=plate_padding,
         )
+        self.location_retry_interval = location_retry_interval
+        self.location_search_after = {}
         self.model = YOLO(model_path)
         self.stats = {
             "model_batch_calls": 0,   
@@ -37,7 +40,12 @@ class YoloPlateDetector(PlateDetector):
             "projected_car_ids": [],
             "detect_car_ids": [],
             "redetect_car_ids": [],
+            "location_wait_car_ids": [],
         }
+
+    def reset(self):
+        super().reset()
+        self.location_search_after.clear()
 
     def _best_plate(self, plates):
         return max(
@@ -86,6 +94,7 @@ class YoloPlateDetector(PlateDetector):
             "projected_car_ids": [],
             "detect_car_ids": [],
             "redetect_car_ids": [],
+            "location_wait_car_ids": [],
         }
 
         results = {}
@@ -97,13 +106,21 @@ class YoloPlateDetector(PlateDetector):
             if crop is None or crop.size == 0:
                 continue
 
+            waiting_for_retry = frame_idx < self.location_search_after.get(track_id, 0)
+
             if track_id not in self.car_to_plate:
+                if waiting_for_retry:
+                    self.last_frame_stats["location_wait_car_ids"].append(track_id)
+                    continue
                 cars_to_detect[track_id] = car_info
                 self.last_frame_stats["detect_car_ids"].append(track_id)
                 continue
 
             plate_id = self.car_to_plate[track_id]
             if plate_id not in self.plate_tracks:
+                if waiting_for_retry:
+                    self.last_frame_stats["location_wait_car_ids"].append(track_id)
+                    continue
                 cars_to_detect[track_id] = car_info
                 self.last_frame_stats["detect_car_ids"].append(track_id)
                 continue
@@ -114,6 +131,11 @@ class YoloPlateDetector(PlateDetector):
             if self.plate_is_lost(plate_track, projected_bbox, frame_idx, frame_size):
                 plate_track["status"] = "lost"
                 plate_track["redetected"] = True
+                if waiting_for_retry:
+                    results[track_id] = projected_bbox
+                    self.last_frame_stats["location_wait_car_ids"].append(track_id)
+                    self.last_frame_stats["projected_car_ids"].append(track_id)
+                    continue
                 cars_to_detect[track_id] = car_info
                 self.stats["redetect_queued"] += 1
                 self.last_frame_stats["redetect_car_ids"].append(track_id)
@@ -150,6 +172,23 @@ class YoloPlateDetector(PlateDetector):
                         continue
 
                     px1, py1, px2, py2, plate_conf = plate_local
+                    if plate_conf <= self.min_plate_confidence:
+                        self.location_search_after[track_id] = (
+                            frame_idx + self.location_retry_interval
+                        )
+                        self.last_frame_stats["location_wait_car_ids"].append(track_id)
+                        plate_id = self.car_to_plate.get(track_id)
+                        if plate_id in self.plate_tracks:
+                            prev = self.plate_tracks[plate_id]
+                            if prev.get("rel_bbox") is not None:
+                                results[track_id] = self.project_bbox(
+                                    car_info["bbox"], prev["rel_bbox"]
+                                )
+                                self.last_frame_stats["projected_car_ids"].append(track_id)
+                        continue
+
+                    self.location_search_after.pop(track_id, None)
+
                     plate_bbox = [
                         px1 + car_x1,
                         py1 + car_y1,
@@ -185,6 +224,7 @@ class YoloPlateDetector(PlateDetector):
 
         for track_id in lost_cars:
             plate_id = self.car_to_plate.pop(track_id, None)
+            self.location_search_after.pop(track_id, None)
             if plate_id in self.plate_tracks:
                 del self.plate_tracks[plate_id]
 
