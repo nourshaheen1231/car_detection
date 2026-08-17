@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from bridge.video_writer import FFmpegStreamWriter
 
 from ultralytics import YOLO
+import openvino as ov
 
 VEHICLE_CLASSES = {"car", "truck", "bus", "motorcycle", "bicycle"}
 
@@ -35,6 +36,8 @@ class CarDetection:
         confidence_threshold=0.6,
         plate_roi_ratio=0.45,
     ):
+        # self._patch_openvino_for_igpu()
+
         self.model = YOLO(model_path)
         self.type_classifier = type_classifier
         self.color_detector = color_detector
@@ -69,6 +72,17 @@ class CarDetection:
             "analysis_queue": deque(maxlen=2000),
             "result_queue": deque(maxlen=2000),
         }
+
+    # def _patch_openvino_for_igpu(self):
+    #     """Forces OpenVINO to compile for Intel iGPU, bypassing PyTorch CUDA checks."""
+    #     if not hasattr(ov.Core, "_original_compile_model"):
+    #         ov.Core._original_compile_model = ov.Core.compile_model
+            
+    #     def _gpu_interceptor(core_self, model, device_name=None, *args, **kwargs):
+    #         print(f"[INFO] OpenVINO Intercepted: Redirecting from {device_name} to Intel iGPU (GPU)")
+    #         return ov.Core._original_compile_model(core_self, model, "GPU", *args, **kwargs)
+            
+    #     ov.Core.compile_model = _gpu_interceptor
 
     # PUBLIC API: Streaming Entry Point
     def process_streaming(

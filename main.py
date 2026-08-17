@@ -28,7 +28,7 @@ def main():
     start_time = time.time()
     
     input_video_path = "input_videos/input_video14.mp4"
-    output_video_path = "output_videos/output_video14.8.mp4"
+    output_video_path = "output_videos/output_video14.14.mp4"
     stub_path = "tracker_stubs/car_detection.pkl"
     read_from_stub = False  
     PLATE_BACKEND = "cv"    # "cv" أو "yolo"
